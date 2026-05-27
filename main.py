@@ -1,17 +1,26 @@
 from modules.weather import WeatherProvider
 from modules.news import NewsFetcher
+from modules.summarizer import NewsSummarizer
 
-clima_melipilla = WeatherProvider(-33.6895,-71.2146)
-print(clima_melipilla.get_weather())
+# 1. ---Setup---
 
-URLs = ["https://feeds.bbci.co.uk/mundo/temas/tecnologia/rss.xml"]
+API_KEY = "YOUR_API_KEY"
+rss_urls = ["https://feeds.bbci.co.uk/mundo/temas/tecnologia/rss.xml"]
 
-noticias = NewsFetcher(URLs)
+weather_service = WeatherProvider(-33.6895, -71.2146)
+news_service = NewsFetcher(rss_urls)
+ai_service = NewsSummarizer(API_KEY)
 
-feed = noticias.get_top_news()
+# 2. ---Execution---
+print("📡 Fetching weather and news...")
+current_weather = weather_service.get_weather()
+current_news = news_service.get_top_news()
 
-print("")
+print("🤖 Groq is thinking...")
+# We pass the data we collected to the AI
+briefing = ai_service.generate_briefing(current_weather, current_news)
 
-for n in feed:
-    print(f"📰 {n['title']}")
-    print(f"🔗 Link: {n['link']}\n")
+# 3. ---Final Result---
+print("-" * 30)
+print(briefing)
+print("-" * 30)
