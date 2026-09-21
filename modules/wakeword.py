@@ -1,0 +1,128 @@
+"""Wake word JARVIS con openWakeWord.
+
+openWakeWord (Apache-2.0, ONNX, local). Sesión 3: usa el modelo preentrenado
+"hey jarvis"; entrenar un "jarvis" corto (grabaciones propias + Piper) queda
+para una fase posterior (ver TAREAS_PENDIENTES).
+
+`WakeWordDetector` es lógica pura (numpy int16 -> puntajes) y se testea con un
+modelo falso. `crear_detector()` es la factoría con **degradación elegante**:
+si openwakeword/onnxruntime faltan o el modelo no carga, devuelve None y la app
+sigue funcionando con hotkeys/bandeja (solo se pierde la wake word).
+"""
+import logging
+from pathlib import Path
+import urllib.request
+
+from config import (
+    WAKE_WORD_ARCHIVO,
+    WAKE_WORD_HISTERESIS,
+    WAKE_WORD_MODELO,
+    WAKE_WORD_UMBRAL,
+)
+
+logger = logging.getLogger("josesito")
+
+# openWakeWord no empaqueta los modelos: se descargan de GitHub Releases al
+# primer uso (una sola vez). ONNX (no tflite): onnxruntime es la dependencia.
+_BASE_DESCARGAS = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/"
+_MODELOS_ONNX = ("embedding_model.onnx", "melspectrogram.onnx", "hey_jarvis_v0.1.onnx")
+
+
+def _clave_prediccion(claves):
+    """Elige la etiqueta del modelo: la de 'jarvis' si existe, si no la primera."""
+    for clave in claves:
+        if "jarvis" in clave:
+            return clave
+    return claves[0] if claves else None
+
+
+class WakeWordDetector:
+    """Detecta el flanco de la wake word con histéresis y gating de eco.
+
+    - Retroceso: solo dispara una vez por mantención de energía sonora.
+    - Gating: mientras `esta_hablando()` sea True, no dispara (el asistente se
+      oye a sí mismo), pero se blinda para no disparar al terminar de hablar.
+    """
+
+    def __init__(
+        self,
+        modelo,
+        al_detectar=None,
+        umbral=WAKE_WORD_UMBRAL,
+        histeresis=WAKE_WORD_HISTERESIS,
+        esta_hablando=None,
+    ):
+        self._modelo = modelo
+        self.al_detectar = al_detectar
+        self._umbral = umbral
+        self._hist = histeresis
+        self._esta_hablando = esta_hablando or (lambda: False)
+        self._disparado = False
+
+    def alimentar(self, audio):
+        """`audio`: np.ndarray int16 mono (~80 ms). True solo en el flanco."""
+        prediccion = self._modelo.predict(audio)
+        clave = _clave_prediccion(prediccion)
+        if clave is None:
+            return False
+        puntaje = prediccion[clave]
+        if puntaje >= self._umbral:
+            if not self._disparado:
+                self._disparado = True
+                if not self._esta_hablando() and self.al_detectar is not None:
+                    self.al_detectar()
+                    return True
+        elif puntaje < self._hist:
+            self._disparado = False
+        return False
+
+    def reset(self):
+        self._disparado = False
+        if hasattr(self._modelo, "reset"):
+            self._modelo.reset()
+
+
+def _directorio_modelos():
+    import openwakeword
+
+    return Path(openwakeword.__file__).parent / "resources" / "models"
+
+
+def _asegurar_modelos():
+    """Descarga (una sola vez) los modelos ONNX que openwakeword no incluye."""
+    directorio = _directorio_modelos()
+    directorio.mkdir(parents=True, exist_ok=True)
+    for nombre in _MODELOS_ONNX:
+        destino = directorio / nombre
+        if destino.exists() and destino.stat().st_size > 0:
+            continue
+        url = _BASE_DESCARGAS + nombre
+        logger.info("Descargando modelo ONNX de wake word: %s", nombre)
+        urllib.request.urlretrieve(url, destino)
+
+
+def crear_detector(compartido=None, al_detectar=None):
+    """Factoría con degradación elegante; devuelve None si algo falla."""
+    try:
+        from openwakeword.model import Model
+    except ImportError as exc:
+        logger.warning("Wake word desactivada: openwakeword no disponible (%s).", exc)
+        return None
+    try:
+        _asegurar_modelos()
+        if WAKE_WORD_ARCHIVO:
+            modelo = Model(wakeword_models=[WAKE_WORD_ARCHIVO], inference_framework="onnx")
+        else:
+            # Solo "hey jarvis" (un `Model()` sin nombres cargaría TODO y fallaría
+            # porque el resto de preentrenados no está descargado).
+            modelo = Model(wakeword_models=[WAKE_WORD_MODELO], inference_framework="onnx")
+    except Exception as exc:
+        logger.warning("Wake word desactivada: no se pudo cargar el modelo (%s).", exc)
+        return None
+    detector = WakeWordDetector(
+        modelo,
+        al_detectar=al_detectar,
+        esta_hablando=(lambda: compartido.hablando) if compartido else (lambda: False),
+    )
+    logger.info("Wake word activa (modelo: %s, umbral: %s).", WAKE_WORD_MODELO, WAKE_WORD_UMBRAL)
+    return detector

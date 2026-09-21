@@ -56,6 +56,16 @@ TEMPERATURA_LLM = 0.7
 MAX_TOKENS_SALIDA = 1024
 EVITAR_MARKDOWN = True  # por ahora solo informativo para el prompt
 
+# --- Router de intenciones (cascada local: reglas -> embeddings -> Brain) ---
+ROUTER_ACTIVO = True              # False = todo va al LLM (comportamiento previo)
+# Capa 2 (embeddings): MEDIDA Y DESCARTADA como decisora automática (2026-09).
+# Con potion-multilingual-128M el coseno zero-shot no separa: "¿qué hora es?" (ruido)
+# puntúa 0.61 mientras "me gustaría saber si llueve" solo 0.29. Actívala solo para
+# experimentar; sin un clasificador entrenado (requiere torch) no es fiable.
+ROUTER_EMBEDDINGS_ACTIVO = False
+ROUTER_UMBRAL_CONFIANZA = 0.55    # similitud coseno mínima si se habilita la capa 2
+ROUTER_MODELO_EMBEDDINGS = "minishlab/potion-multilingual-128M"  # estático, 101 idiomas, MIT
+
 # --- Micrófono / voz ---
 PAUSA_SILENCIO = 1.5      # segundos de silencio para cortar recording
 DURACION_MAX_GRABACION = 30.0   # tope de seguridad de grabación
@@ -79,3 +89,28 @@ OPENCODE_PROYECTOS = {
 }
 OPENCODE_TIMEOUT = 300      # segundos; opencode puede ser lento
 OPENCODE_SALIDA_MAX = 4000  # chars máx de salida que se devuelve al LLM
+
+# --- Segundo plano (app.py) ---
+# Proceso sin consola: `python app.py` (o `pythonw app.py`). El lock de instancia
+# única y el log rotatorio viven aquí; hotkeys/wake word/bandeja se conectan en
+# sesiones siguientes (ver TAREAS_PENDIENTES.md).
+NOMBRE_INSTANCIA = "josesito"
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_ARCHIVO = LOG_DIR / "josesito.log"
+LOG_NIVEL = "INFO"
+
+# --- Segundo plano: hotkeys globales y bandeja ---
+# Nombres de tecla válidos: ver `_normalizar` en modules/hotkeys.py.
+HOTKEY_PTT = ["ctrl", "f7"]        # push-to-talk: mantener presionada para grabar
+HOTKEY_WAKE_TOGGLE = ["ctrl", "f8"]  # activa/desactiva la wake word JARVIS
+TRAY_NOMBRE = "Josesito"
+
+# --- Segundo plano: wake word JARVIS y audio continuo ---
+# openWakeWord (Apache-2.0, ONNX local). Sesión 3: modelo preentrenado.
+# Para custom: WAKE_WORD_ARCHIVO = ruta a un .onnx entrenado.
+WAKE_WORD_MODELO = "hey jarvis"  # preentrenado que trae openwakeword
+WAKE_WORD_ARCHIVO = None         # None = usar el preentrenado por clave/lista
+WAKE_WORD_UMBRAL = 0.5           # score para disparar
+WAKE_WORD_HISTERESIS = 0.25      # por debajo de esto se rearma el detector
+STREAM_TASA = 16000              # el modelo de openwakeword usa 16 kHz
+STREAM_BLOQUE = 1280             # frames por bloque = 80 ms @ 16 kHz

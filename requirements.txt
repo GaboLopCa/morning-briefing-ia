@@ -8,3 +8,14 @@ sounddevice
 numpy
 scipy
 python-dotenv
+# Segundo plano (app.py): bandeja, hotkeys globales e icono de la bandeja.
+pynput==1.8.2
+pystray==0.19.5
+Pillow==12.3.0
+# Wake word JARVIS (openWakeWord, Apache-2.0, ONNX). Los modelos ONNX se
+# descargan solos de GitHub Releases al primer uso (~3.7 MB, una sola vez).
+openwakeword==0.6.0
+onnxruntime==1.30.0
+# Capa 2 del router (embeddings estáticos, sin torch). Desactivada por defecto:
+# solo hace falta si pones ROUTER_EMBEDDINGS_ACTIVO = True en config.py.
+model2vec

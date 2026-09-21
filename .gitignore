@@ -137,6 +137,10 @@ celerybeat.pid
 speech_output.mp3
 user_command.wav
 
+# Logs del segundo plano (logging rotatorio) y locks de instancia
+logs/
+*.lock
+
 # IDE
 .vscode/
 env/

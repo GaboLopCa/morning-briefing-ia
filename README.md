@@ -1,5 +1,7 @@
 # Josesito Home Assistant
 
+> 📌 **Roadmap y tareas pendientes**: [`TAREAS_PENDIENTES.md`](TAREAS_PENDIENTES.md) (segundo plano con wake word JARVIS + hotkey, chateo remoto desde el celular, acciones en el PC).
+
 ## 📋 Visión del Proyecto
 
 **Josesito Home Assistant** es un asistente personal inteligente de voz y texto, diseñado como un "briefing matutino" personalizado para Gabriel, estudiante de ingeniería de software. El sistema combina múltiples fuentes de información en tiempo real (clima, noticias, búsqueda web) con una personalidad única de presentador de radio satírico y directo, originario de Melipilla, que habla en español neutro.
@@ -27,6 +29,7 @@ El sistema sigue una arquitectura de **microservicios locales** donde un orquest
            ├──► modules/news.py          (NewsFetcher)
            ├──► modules/search.py        (WebSearcher)
            ├──► modules/opencode_tool.py (OpenCodeRunner)
+           ├──► modules/router.py        (RouterIntenciones - cascada local)
            ├──► modules/summarizer.py    (Brain - motor Groq streaming)
            ├──► modules/voice.py         (VoiceAssistant)
            └──► modules/ear.py           (AudioEar)
@@ -67,6 +70,13 @@ ENTRADA (Texto/Mic)
 │   - VAD por RMS + calibración          │
 │   - Transcripción con Whisper (Groq)  │
 │   (whisper-large-v3-turbo)            │
+└───────────────┬───────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────┐
+│   RouterIntenciones (cascada local)   │
+│   - Reglas ES (rechaza negación)      │
+│   - Si no decide → delega al Brain    │
 └───────────────┬───────────────────────┘
                 │
                 ▼
@@ -226,6 +236,24 @@ OpenCodeRunner(confirmador=fn) -> ejecutar(*, proyecto: str, peticion: str) -> e
 
 ---
 
+### 8. **RouterIntenciones** (`modules/router.py`)
+**Responsabilidad**: Resolver comandos triviales (clima, noticias, búsqueda, opencode) sin despertar al LLM, y delegar el resto al `Brain`.
+
+- **Cascada**: reglas → embeddings (opcional) → `None` (delega al `Brain`)
+- **Capa 1 (reglas)**: patrones en español sobre texto normalizado (NFKD sin tildes). Exige ausencia de negación (`no`, `nunca`, `ni`, …) para no invertir la intención; extrae `query` de "busca …" preservando tildes y `proyecto`/`peticion` de "opencode …" contra el enum del registry
+- **Slots**: si falta el slot (p. ej. "busca" sin nada), devuelve `None` y decide el LLM
+- **Capa 2 (embeddings)**: similitud coseno sobre `descripcion` + `frases` del registry con `model2vec` estático multilingüe. **Desactivada por defecto** (`ROUTER_EMBEDDINGS_ACTIVO = False`): la calibración 2026-09 mostró que el coseno zero-shot no separa (ruido "¿qué hora es?" 0.61 vs "si llueve" 0.29) y el clasificador entrenado de `model2vec` exige PyTorch
+- **Respuesta**: `ejecutar()` corre el handler y devuelve **texto fijo** determinista (clima, titulares, búsqueda, salida de opencode), sin narración del LLM
+- **Interruptor**: `ROUTER_ACTIVO = False` restaura el comportamiento previo (todo al LLM)
+
+**Interfaz**:
+```python
+RouterIntenciones(registro, encoder=None, ...) -> decidir(texto: str) -> Decision | None
+RouterIntenciones(...) -> ejecutar(decision: Decision) -> str
+```
+
+---
+
 ## 🔄 Modos de Operación
 
 Al iniciar, `main.py` muestra un menú interactivo (`seleccionar_modo_interfaz()`). No existe una constante; la selección se hace en cada ejecución.
@@ -241,6 +269,14 @@ Al iniciar, `main.py` muestra un menú interactivo (`seleccionar_modo_interfaz()
 - Calibración inicial de ruido (2 s)
 - Controles: **ESPACIO** graba, **ESC** apaga
 - **Solo Windows** (`msvcrt`); en otra plataforma el wizard aborta el arranque con mensaje claro
+
+### Opción 3: **Segundo plano** (app.py)
+- Bandeja de sistema (`pystray`) + hotkeys globales: **Ctrl+F7** push-to-talk, **Ctrl+F8** activate/deactivate wake word
+- **Wake word JARVIS** (openWakeWord, ONNX local): di "hey jarvis" para hablar. Modelos descargados automáticamente al primer uso (~3.7 MB); umbral ajustable en `config.py`
+- Máquina de estados `IDLE → GRABANDO → TRANSCRIBIENDO → PENSANDO → HABLANDO → IDLE` procesada por un único hilo (`modules/cola.py`); hotkeys, bandeja y wake word solo encolan eventos
+- Instancia única, logging rotatorio a `logs/josesito.log`, arranque sin consola compatible con `pythonw.exe`
+- `python app.py --debug` simula la máquina de estados por consola
+- La grabación para transcripción desde el mismo micrófono se conecta en la sesión 4 (ver `TAREAS_PENDIENTES.md`)
 
 ---
 
@@ -259,6 +295,12 @@ numpy                  # Procesamiento de señales (RMS)
 scipy                  # Escritura de archivos WAV
 python-dotenv          # Variables de entorno
 pytest                 # Tests
+model2vec              # Router, capa 2 de embeddings estáticos (opcional, desactivada por defecto)
+pynput==1.8.2          # Hotkeys globales del segundo plano
+pystray==0.19.5        # Bandeja de sistema del segundo plano
+Pillow==12.3.0         # Icono de la bandeja
+openwakeword==0.6.0    # Wake word JARVIS (modelos ONNX descargados al primer uso)
+onnxruntime==1.30.0    # Motor ONNX de openWakeWord
 ```
 
 ### APIs Externas
@@ -328,8 +370,8 @@ Usuario: "Crea un skill de opencode para X en el proyecto briefing"
 
 ## 🧪 Testing
 
-- **56 tests** en `tests/` (`test_weather.py`, `test_news.py`, `test_search.py`, `test_tools_registry.py`, `test_brain.py`, `test_opencode_tool.py`).
-- Cubren: mapeo WMO, filtro de 24 h y caps de noticias, dedup de búsqueda, formato de tools OpenAIA/Groq (`Brain._tools_openai`), formateo del contexto prefetch, recorte de memoria por pares, dispatch de herramientas y el ciclo de `OpenCodeRunner` (confirmación, timeout, truncado) — todo mockeado, sin red.
+- **107 tests** en `tests/` (`test_weather.py`, `test_news.py`, `test_search.py`, `test_tools_registry.py`, `test_brain.py`, `test_opencode_tool.py`, `test_router.py`, `test_estados.py`, `test_single_instance.py`, `test_hotkeys.py`, `test_cola.py`, `test_tray.py`, `test_wakeword.py`, `test_audio_stream.py`).
+- Cubren: mapeo WMO, filtro de 24 h y caps de noticias, dedup de búsqueda, formato de tools OpenAIA/Groq (`Brain._tools_openai`), formateo del contexto prefetch, recorte de memoria por pares, dispatch de herramientas, el ciclo de `OpenCodeRunner` (confirmación, timeout, truncado) y el router (reglas, negación, extracción de slots, umbral de embeddings con encoder falso, formato de respuestas) — todo mockeado, sin red ni descarga de modelos.
 - Verificación manual: `python -m pytest` y una corrida en modo texto preguntando clima/noticias/búsqueda.
 
 ---
@@ -355,9 +397,11 @@ Usuario: "Crea un skill de opencode para X en el proyecto briefing"
 7. **opencode con confirmación + allowlist**: la única tool con efectos sobre el sistema de archivos
 8. **Retries 429/5xx + fallback de tools**: resiliencia ante rate-limit y picos del API sin degradar la conversación a silencios
 9. **Migración completa a Groq (2026-09)**: se eliminó `google-genai` y `websockets`; el cerebro usa `chat.completions` streaming y el STT usa Whisper de Groq. Los modelos `llama-3.*` no existen en esta cuenta gratis: el cerebro es `qwen/qwen3.8-27b`.
+10. **Router local antes del LLM (2026-09)**: los comandos triviales se resuelven con una cascada local barata (reglas en español) y respuestas fijas, sin round-trip al modelo. La capa de embeddings quedó **desactivada** tras medirla: con `potion-multilingual-128M` el coseno zero-shot no discrimina y el clasificador entrenado de `model2vec` requiere PyTorch. La vía preferida si se quiere ML local es un clasificador liviano (p. ej. regresión logística sobre los embeddings con scikit-learn) o un modelo System One open.
 
 ### Limitaciones Conocidas
 - Modo micrófono solo en Windows (`msvcrt`)
+- Router sin capa ML activa: los parafraseos que no casan con una regla caen al LLM (la capa de embeddings está desactivada por precisión)
 - Memoria no persiste entre sesiones
 - Sin interfaz gráfica
 - `ejecutar_opencode` depende de que el CLI `opencode` esté autenticado en el equipo
@@ -374,4 +418,4 @@ Usuario: "Crea un skill de opencode para X en el proyecto briefing"
 ---
 
 **Última actualización**: Septiembre 2026
-**Versión**: 3.1.0 (cerebro + STT migrados a Groq; adiós Google)
+**Versión**: 3.4.0 (segundo plano: wake word JARVIS sobre la máquina de estados + hotkeys + bandeja)

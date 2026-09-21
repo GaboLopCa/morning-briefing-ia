@@ -12,13 +12,18 @@ Handler = Callable[..., Dict[str, Any]]
 
 @dataclass
 class Herramienta:
-    """Definición declarativa de una tool disponible para el LLM."""
+    """Definición declarativa de una tool disponible para el LLM.
+
+    `frases` son ejemplos de cómo pide el usuario esta capacidad; el router local
+    las usa como prototipos de similitud. No viajan al LLM (`a_declaracion` las ignora).
+    """
 
     nombre: str
     descripcion: str
     parametros_schema: Dict[str, Any] = field(default_factory=dict)
     handler: Handler = lambda: {}
     requerido: List[str] = field(default_factory=list)
+    frases: List[str] = field(default_factory=list)
 
     def a_declaracion(self) -> Dict[str, Any]:
         """Convierte la tool al `FunctionDeclaration` plano ({name, description, parameters})."""
@@ -48,6 +53,14 @@ def construir_registro(*, weather, news, search, opencode) -> Dict[str, Herramie
             ),
             parametros_schema={},
             handler=lambda: weather.get_weather(),
+            frases=[
+                "¿cómo está el clima?",
+                "¿va a llover hoy?",
+                "¿qué temperatura hay?",
+                "¿cómo está el tiempo?",
+                "dame el pronóstico",
+                "¿necesito paraguas?",
+            ],
         ),
         "get_news_data": Herramienta(
             nombre="get_news_data",
@@ -57,6 +70,14 @@ def construir_registro(*, weather, news, search, opencode) -> Dict[str, Herramie
             ),
             parametros_schema={},
             handler=lambda: news.get_top_news(),
+            frases=[
+                "¿cuáles son las noticias de hoy?",
+                "dame los titulares",
+                "¿qué pasó en Chile?",
+                "última hora",
+                "resumen de noticias",
+                "qué se dice en las portadas",
+            ],
         ),
         "search_internet_data": Herramienta(
             nombre="search_internet_data",
@@ -72,6 +93,13 @@ def construir_registro(*, weather, news, search, opencode) -> Dict[str, Herramie
             },
             requerido=["query"],
             handler=lambda query: search.search_internet(query),
+            frases=[
+                "busca en internet sobre un tema",
+                "¿quién ganó el partido de anoche?",
+                "investiga las novedades de tecnología",
+                "resultados de la fecha de fútbol",
+                "googlea esa duda",
+            ],
         ),
         "ejecutar_opencode": Herramienta(
             nombre="ejecutar_opencode",
@@ -95,5 +123,9 @@ def construir_registro(*, weather, news, search, opencode) -> Dict[str, Herramie
             },
             requerido=["proyecto", "peticion"],
             handler=lambda proyecto, peticion: opencode.ejecutar(proyecto=proyecto, peticion=peticion),
+            frases=[
+                "ejecuta opencode en el proyecto briefing",
+                "pídele a opencode que revise el código",
+            ],
         ),
     }

@@ -25,6 +25,7 @@ from config import (  # noqa: E402
 from modules.ear import AudioEar
 from modules.news import NewsFetcher
 from modules.opencode_tool import OpenCodeRunner
+from modules.router import RouterIntenciones
 from modules.search import WebSearcher
 from modules.summarizer import Brain
 from modules.tools import construir_registro
@@ -38,13 +39,16 @@ def seleccionar_modo_interfaz():
         print("\n🎛️  SELECCIÓN DE ENTRADA (Josesito Assistant)")
         print("1. [Modo Texto]   -> Ideal para clases o trabajo en silencio.")
         print("2. [Modo Mic]     -> Activa el micrófono dinámico con VAD (RMS).")
+        print("3. [Segundo plano] -> Bandeja + hotkeys (Ctrl+F7 PTT, Ctrl+F8 wake).")
 
-        opcion = input("Selecciona una opción (1 o 2): ").strip()
+        opcion = input("Selecciona una opción (1, 2 o 3): ").strip()
         if opcion == "1":
             return "texto"
         if opcion == "2":
             return "mic"
-        print("⚠️ Opción no válida. Por favor, digita 1 o 2.")
+        if opcion == "3":
+            return "segundo_plano"
+        print("⚠️ Opción no válida. Por favor, digita 1, 2 o 3.")
 
 
 def pedir_confirmacion_opencode(peticion, ruta):
@@ -71,6 +75,15 @@ def main():
 
     modo = seleccionar_modo_interfaz()
 
+    if modo == "segundo_plano":
+        # Bandeja + hotkeys + wake word (JARVIS). Reutiliza app.py tal cual:
+        # instancia única, logging rotatorio y máquina de estados en su propio
+        # hilo; la bandeja corre en el main thread (requisito de Windows).
+        from app import main as main_segundo_plano
+
+        main_segundo_plano([])
+        return
+
     if modo == "mic":
         if not sys.platform.startswith("win"):
             print("❌ El modo micrófono solo está disponible en Windows (msvcrt).")
@@ -94,6 +107,7 @@ def main():
         opencode=opencode_runner,
     )
     ai_service = Brain(GROQ_API_KEY, registro)
+    router = RouterIntenciones(registro)  # cascada local antes del LLM
     voice_service = VoiceAssistant()
     ear_service = AudioEar(GROQ_API_KEY)
 
@@ -154,11 +168,17 @@ def main():
 
             # --- PIPELINE DE PROCESAMIENTO COMÚN (Orquestador Central) ---
             if user_command:
-                print("🤖 Enviando comando a la red cognitiva...")
-                briefing = ai_service.generate_response(
-                    user_command,
-                    on_fragment=lambda fragmento: print(fragmento, end="", flush=True),
-                )
+                decision = router.decidir(user_command)
+                if decision is not None:
+                    print(f"⚡ Router local → {decision.herramienta} ({decision.origen})")
+                    briefing = router.ejecutar(decision)
+                    print(briefing)
+                else:
+                    print("🤖 Enviando comando a la red cognitiva...")
+                    briefing = ai_service.generate_response(
+                        user_command,
+                        on_fragment=lambda fragmento: print(fragmento, end="", flush=True),
+                    )
                 print("\n" + "=" * 40 + "\n")
 
                 if modo == "texto":
