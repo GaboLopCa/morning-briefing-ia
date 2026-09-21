@@ -1,3 +1,10 @@
-google-genai
+groq
 requests
 feedparser
+ddgs
+edge-tts
+pygame
+sounddevice
+numpy
+scipy
+python-dotenv
