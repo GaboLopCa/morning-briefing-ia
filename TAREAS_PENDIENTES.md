@@ -1,6 +1,6 @@
 # Tareas Pendientes — Josesito (Josesito Home Assistant)
 
-Documento de trabajo con el roadmap y las decisiones ya tomadas. Especificación técnica: `README.md`. Convenciones: español, commits convencionales. Estado actual (2026-09): **v3.4.0** con cerebro Groq (`qwen/qwen3.8-27b`), STT Whisper (`whisper-large-v3-turbo`), **router de intenciones por reglas** y **segundo plano con wake word JARVIS activa** (107 tests verdes).
+Documento de trabajo con el roadmap y las decisiones ya tomadas. Especificación técnica: `README.md`. Convenciones: español, commits convencionales. Estado actual (2026-09): **v3.5.0** con cerebro Groq (`qwen/qwen3.8-27b`), STT Whisper (`whisper-large-v3-turbo`), **router de intenciones por reglas** y **segundo plano con wake word JARVIS + transcripción de voz** (119 tests verdes).
 
 > Marca con `[x]` lo que vaya quedando listo.
 
@@ -13,9 +13,8 @@ Cada sesión deja el proyecto en estado funcional y testeable.
 | 1 | ✅ **Terminada** | Base del segundo plano: `app.py` + `modules/estados.py` (máquina pura), `modules/logging_setup.py` (rotatorio), `modules/single_instance.py` (lock), modo `--debug` de simulación, tests. **88 tests verdes.** |
 | 2 | ✅ **Terminada** | Hotkeys (`modules/hotkeys.py` + `DetectorHotkeys` puro) + bandeja (`modules/tray.py`, `pystray` + `Pillow`) + `modules/cola.py` (eventos → un hilo) + menú opción 3 en `main.py`. Deps pineadas. **98 tests verdes.** |
 | 3 | ✅ **Terminada** | Wake word **JARVIS**: `modules/wakeword.py` (`WakeWordDetector` + factoría con descarga automática de modelos ONNX desde GitHub Releases), `modules/audio_stream.py` (InputStream 16 kHz continuo), gating de eco (`Compartido.hablando`), `Evento.WAKE` → cola. Modelo preentrenado "hey jarvis". **107 tests verdes.** |
-| 4 | ⏳ Siguiente | `modules/ear.py`: `grabar_hasta_silencio(stream)` reutilizable + `user_command.wav` a `tempfile` + la máquina graba desde el mismo `Capturador` (VAD) y transpone Whisper → `Evento.FIN_AUDIO`/`AUDIO_ABORTADO`. |
-| 4 | | `modules/ear.py`: `grabar_hasta_silencio(stream)` reutilizable + `user_command.wav` a `tempfile` + test E2E del bucle con chunks simulados. |
-| 5+ | | Chateo remoto (Telegram recomendado), `pc_actions`, memoria RAG, Home Assistant. |
+| 4 | ✅ **Terminada** | **Audio para transcripción**: `modules/recorder.py` (`Grabadora` VAD por RMS reutilizable, `nivel_rms` normaliza int16 a [-1,1], WAV en `tempfile`, corte por silencio/tope/PTT), `modules/ear.py` refactorizado (reusa `Grabadora`; `transcribir()` standalone sin prints), `app.py` graba desde el mismo `Capturador` y lanza Whisper en un hilo → `Evento.TEXTO_LISTO`. **119 tests verdes.** |
+| 5 | ⏳ Siguiente | Conectar PENSANDO → `Brain` (router/preguntas) y HABLANDO → TTS (edge-tts + pygame); de momento el flujo llega hasta PENSANDO y queda en logging. |
 
 ---
 
@@ -53,12 +52,13 @@ Arquitectura acordada: un único `sounddevice.InputStream` de 16 kHz siempre abi
 
 **Ojo (medido 2026-09)**: en terreno, "hey jarvis" preentrenado puede disparar en falso o no oírte; calibrar `WAKE_WORD_UMBRAL` y, si falla, entrenar un **"jarvis" corto** (grabaciones reales + Piper + negativos ~1-3 h, ~840 KB ONNX) con las vías del doc de la sección 2.
 
-### Sesión 4 — Audio para transcripción (pendiente)
-- [ ] `modules/ear.py`: extraer `grabar_hasta_silencio(stream, ...)` reutilizable y mover `user_command.wav` a `tempfile.gettempdir()` (hoy escribe en cwd).
-- [ ] Grabación desde el mismo `Capturador` de la sesión 3: cuando la máquina entra en GRABANDO se acumulan bloques con VAD (RMS), se corta con `FIN_AUDIO`/`AUDIO_ABORTADO` y se transcribe con Whisper (Groq) → `Evento.TEXTO_LISTO`.
-- [ ] Test E2E con chunks simulados (sin mic real): `WAKE` → audio simulado → `FIN_AUDIO` → `TEXTO_LISTO`; gating mientras `hablando`.
+### Sesión 4 — Audio para transcripción (terminada)
+- [x] `modules/recorder.py`: `nivel_rms()` (normaliza int16 a escala [-1,1], un umbral vale igual para float32/int16) y `Grabadora` (estado compartido con lock, reloj inyectable para tests): `comenzar()` reinicia el buffer, `alimentar()` corta por silencio/pausa o tope y llama `on_fin(ruta)`/`on_abortado()`, `finalizar_manual()` (PTT soltado sin silencio) corta "ahora" y devuelve la ruta sin re-eventear. WAV en `tempfile.gettempdir()`.
+- [x] `modules/ear.py`: `record_audio()` reusa `Grabadora` (mismo VAD que el segundo plano) y escribe en temp; extraído `transcribir(api_key, ruta)` **standalone** (sin prints, borra el WAV en `finally`) que usa también el plugin de transcripción del segundo plano; `AudioEar.transcribe_audio` delega.
+- [x] `app.py`: la misma `Grabadora` acumula bloques del `Capturador` cuando la máquina entra en GRABANDO; el corte dispara `FIN_AUDIO`/`AUDIO_ABORTADO` y la transcripción Whisper corre en un hilo (`_transcribir_y_encolar`) que encola `TEXTO_LISTO` (o `ERROR`). `construir_manejadores(compartido, grabadora, encolar, transcribir)` inyecta todo; sin inyección (= `--debug`) solo loguea. `logger` ya no inicia en `None`: getLogger("josesito") para que handlers/test sin `main()` no rompan.
+- [x] Tests: `tests/test_recorder.py` (8) + `tests/test_flujo_audio.py` (4, E2E con reloj simulado: WAKE→voz→silencio→PENSANDO con texto; wake sin voz→IDLE; PTT suelto sin silencio→transcribe igual; WAV en temp absoluta).
 
-**Nota**: esto elimina `msvcrt` del flujo de mic → resuelve de facto el pendiente de **AudioEar multiplataforma**.
+**Nota**: esto elimina `msvcrt` del flujo de mic → resuelve de facto el pendiente de **AudioEar multiplataforma**. El flujo completo de conversación (PENSANDO→respuesta→HABLANDO→TTS) es la **sesión 5**; por ahora el segundo plano transcribe y deja el texto en `logs` (estado PENSANDO). **Grabadora**: palanca `DURACION_MAX_GRABACION` también aplica como tope *previo* a la primera voz (silencio) — si la wake word dispara en falso, espera ese tope y vuelve a IDLE.
 
 ---
 
@@ -121,6 +121,19 @@ Viene del plan de "router/JEV para PC": catálogo declarativo de acciones de sis
 
 ---
 
+## 6. Skills futuras: calendario, fecha y hora
+
+Idea de Gabriel (2026-09). Implementarlas como herramientas del **router por reglas** (respuestas locales, sin LLM) con el patrón de `modules/tools/registry.py` y `frases`; las que requieran datos externos llevan su propia fuente y allowlist.
+
+- [ ] **Skill «fecha y hora»** (win rápido, sin dependencias): `get_fecha_hora` → `datetime.now()` local (zona Melipilla/Chile). Responde a "¿qué hora es?", "¿qué día es hoy?", "¿qué fecha es?", "¿cuánto falta para la cena?" (límite horario). Reglas + respuesta fija en `modules/router.py`; sin API.
+- [ ] **Skill «calendario»**: `consultar_calendario` → eventos de hoy / mañana / semana en cuanto esté definida la fuente. Pedido de Gabriel: ver el calendario (Clases UCH / trabajo / aniversario, etc.).
+  - [ ] Decidir fuente (por definir): Google Calendar API (OAuth, token en `.env`), Outlook/Exchange, o **archivo `.ics` local** — el `.ics` exportado por Google desde el celu es lo más simple y offline.
+  - [ ] `modules/calendar.py`: parsear eventos → lista `{titulo, fecha, hora_inicio, hora_fin}`; filtros de rango (hoy/mañana/semana).
+  - [ ] Params del tool: `rango` (hoy|mañana|semana), opcional `limite` (máx. eventos). Allowlist de calendarios si hay más de uno.
+  - [ ] Confirmación local (no destructiva; solo lectura). Los datos de calendario son personales: **nunca** loguear títulos en claro más allá del log rotatorio local, y no exponerlos en el canal remoto sin allowlist.
+
+---
+
 ## Decisiones registradas
 
 | Fecha | Decisión |
@@ -132,6 +145,8 @@ Viene del plan de "router/JEV para PC": catálogo declarativo de acciones de sis
 | 2026-09 | Windows primero, but wake word/hotkey agnósticos para Linux/Mac. |
 | 2026-09 | Router: capa 1 (reglas) es la fiable y la única activa; capa 2 embeddings OFF por medición. |
 | 2026-09 | Modelos Groq disponibles para esta cuenta: qwen/qwen3.8-27b (cerebro), gpt-oss-20b/120b, compound, whisper-large-v3(-turbo). No hay llama-3.*. |
+| 2026-09 | Nueva skill futura: **ver calendario + fecha/hora** (router por reglas; calendario vía fuente a decidir, candidata `.ics` local). |
+| 2026-09 | Sesión 4: **grabación VAD reutilizable** (`modules/recorder.py`) compartida entre `ear.py` (modo mic) y el segundo plano; **transcripción en hilo** propio que encola `TEXTO_LISTO`/`ERROR`; WAV siempre en `tempfile`; `logger` inicia como `getLogger("josesito")` (no `None`). |
 
 ## Descartado a propósito
 

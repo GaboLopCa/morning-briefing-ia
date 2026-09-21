@@ -7,23 +7,36 @@ Uso:
 Sesión 2: todas las fuentes (hotkeys, items de la bandeja) encolan `Evento` en
 una `ColaEventos`; un único hilo los procesa contra la `MaquinaEstados`, que no
 es thread-safe. La bandeja corre en el hilo principal (requisito de Windows).
+
+Sesión 4: el mismo `Capturador` alimenta la wake word y, cuando la máquina está
+en GRABANDO, una `Grabadora` (VAD por RMS) acumula bloques; el corte por
+silencio dispara FIN_AUDIO (ruta WAV en temp) y la transcripción con Whisper
+(Groq) corre en un hilo que encola TEXTO_LISTO cuando termina.
 """
 import argparse
 import logging
 import sys
+import threading
 import time
 
-from config import HOTKEY_PTT, HOTKEY_WAKE_TOGGLE, NOMBRE_INSTANCIA
+from config import (
+    GROQ_API_KEY,
+    HOTKEY_PTT,
+    HOTKEY_WAKE_TOGGLE,
+    NOMBRE_INSTANCIA,
+)
 from modules.audio_stream import Capturador
 from modules.cola import ColaEventos
+from modules.ear import transcribir
 from modules.estados import Estado, Evento, MaquinaEstados
 from modules.hotkeys import DetectorHotkeys, Hotkeys
 from modules.logging_setup import configurar_logging
+from modules.recorder import Grabadora
 from modules.single_instance import InstanciaUnica
 from modules.tray import Bandeja
 from modules.wakeword import crear_detector
 
-logger = None  # se asigna en main()
+logger = logging.getLogger("josesito")  # main() lo re-configura con archivo
 
 
 class Compartido:
@@ -34,8 +47,31 @@ class Compartido:
         self.hablando = False  # gating de eco: True mientras el TTS habla
 
 
-def construir_manejadores(compartido=None):
-    """Handlers de entrada a cada estado (Sesiones 1-3: solo logging + gating)."""
+def _transcribir_y_encolar(ruta, encolar, api_key=GROQ_API_KEY):
+    """Transcribe fuera del hilo de la cola y encola TEXTO_LISTO (o ERROR)."""
+
+    def _trabajo():
+        try:
+            texto = transcribir(api_key, ruta)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Fallo al transcribir: %s", exc)
+            encolar(Evento.ERROR)
+            return
+        if texto:
+            encolar(Evento.TEXTO_LISTO, texto)
+        else:
+            encolar(Evento.AUDIO_ABORTADO)
+
+    threading.Thread(target=_trabajo, daemon=True, name="josesito-transcribe").start()
+
+
+def construir_manejadores(compartido=None, grabadora=None, encolar=None, transcribir=None):
+    """Handlers de entrada a cada estado.
+
+    `grabadora`/`encolar`/`transcribir` se inyectan solo en el modo real: con
+    ellos, GRABANDO empieza a acumular audio y TRANSCRIBIENDO transcribe en un
+    hilo. En `--debug` no se pasan y los handlers solo loguean.
+    """
     if compartido is None:
         compartido = Compartido()
 
@@ -50,11 +86,30 @@ def construir_manejadores(compartido=None):
 
         return _fn
 
+    def _al_grabando(datos):
+        if grabadora is not None:
+            grabadora.comenzar()
+        logger.info("Grabando voz")
+
+    def _al_transcribiendo(datos):
+        if grabadora is None or encolar is None or transcribir is None:
+            logger.info("Transcribiendo")
+            return
+        ruta = datos
+        if ruta is None:
+            ruta = grabadora.finalizar_manual()  # PTT soltado antes del silencio
+        if not ruta:
+            logger.info("Sin audio que transcribir; vuelvo a IDLE.")
+            encolar(Evento.AUDIO_ABORTADO)
+            return
+        logger.info("Transcribiendo en hilo: %s", ruta)
+        transcribir(ruta)
+
     return {
         Estado.IDLE: _manejador("En reposo (escuchando trigger)", hablando=False),
-        Estado.GRABANDO: _manejador("Grabando voz"),
-        Estado.TRANSCRIBIENDO: _manejador("Transcribiendo", "texto"),
-        Estado.PENSANDO: _manejador("Pensando"),
+        Estado.GRABANDO: _al_grabando,
+        Estado.TRANSCRIBIENDO: _al_transcribiendo,
+        Estado.PENSANDO: _manejador("Pensando", "texto"),
         Estado.HABLANDO: _manejador("Hablando", "respuesta", hablando=True),
         Estado.PAUSADO: _manejador("Pausado"),
     }
@@ -129,10 +184,25 @@ def main(argv=None):
             return 0
 
         cola = ColaEventos()
-        cola.iniciar(lambda evento, datos: maquina.evento(evento, datos))
         compartido = Compartido()
 
         detector = crear_detector(compartido, al_detectar=lambda: cola.encolar(Evento.WAKE))
+
+        grabadora = Grabadora(
+            on_fin=lambda ruta: cola.encolar(Evento.FIN_AUDIO, ruta),
+            on_abortado=lambda: cola.encolar(Evento.AUDIO_ABORTADO),
+        )
+
+        maquina = MaquinaEstados(
+            construir_manejadores(
+                compartido,
+                grabadora=grabadora,
+                encolar=cola.encolar,
+                transcribir=lambda ruta: _transcribir_y_encolar(ruta, cola.encolar),
+            )
+        )
+        cola.iniciar(lambda evento, datos: maquina.evento(evento, datos))
+
         capturador = None
         if detector is not None:
             capturador = Capturador()
@@ -140,6 +210,8 @@ def main(argv=None):
             def _alimento(datos):
                 if compartido.wake_activa:
                     detector.alimentar(datos)
+                if grabadora.esta_grabando():
+                    grabadora.alimentar(datos)
 
             capturador.suscribir(_alimento)
             try:

@@ -276,7 +276,7 @@ Al iniciar, `main.py` muestra un menú interactivo (`seleccionar_modo_interfaz()
 - Máquina de estados `IDLE → GRABANDO → TRANSCRIBIENDO → PENSANDO → HABLANDO → IDLE` procesada por un único hilo (`modules/cola.py`); hotkeys, bandeja y wake word solo encolan eventos
 - Instancia única, logging rotatorio a `logs/josesito.log`, arranque sin consola compatible con `pythonw.exe`
 - `python app.py --debug` simula la máquina de estados por consola
-- La grabación para transcripción desde el mismo micrófono se conecta en la sesión 4 (ver `TAREAS_PENDIENTES.md`)
+- **Grabación por VAD reutilizable** (`modules/recorder.py`): al decir "hey jarvis" o mantener Ctrl+F7, el mismo micrófono de la wake word acumula audio y corta por silencio; la transcripción Whisper corre en un hilo y encola el texto (hasta el estado PENSANDO; la conversación Brain→TTS es la sesión 5, ver `TAREAS_PENDIENTES.md`)
 
 ---
 
@@ -370,8 +370,8 @@ Usuario: "Crea un skill de opencode para X en el proyecto briefing"
 
 ## 🧪 Testing
 
-- **107 tests** en `tests/` (`test_weather.py`, `test_news.py`, `test_search.py`, `test_tools_registry.py`, `test_brain.py`, `test_opencode_tool.py`, `test_router.py`, `test_estados.py`, `test_single_instance.py`, `test_hotkeys.py`, `test_cola.py`, `test_tray.py`, `test_wakeword.py`, `test_audio_stream.py`).
-- Cubren: mapeo WMO, filtro de 24 h y caps de noticias, dedup de búsqueda, formato de tools OpenAIA/Groq (`Brain._tools_openai`), formateo del contexto prefetch, recorte de memoria por pares, dispatch de herramientas, el ciclo de `OpenCodeRunner` (confirmación, timeout, truncado) y el router (reglas, negación, extracción de slots, umbral de embeddings con encoder falso, formato de respuestas) — todo mockeado, sin red ni descarga de modelos.
+- **119 tests** en `tests/` (`test_weather.py`, `test_news.py`, `test_search.py`, `test_tools_registry.py`, `test_brain.py`, `test_opencode_tool.py`, `test_router.py`, `test_estados.py`, `test_single_instance.py`, `test_hotkeys.py`, `test_cola.py`, `test_tray.py`, `test_wakeword.py`, `test_audio_stream.py`, `test_recorder.py`, `test_flujo_audio.py`).
+- Cubren: mapeo WMO, filtro de 24 h y caps de noticias, dedup de búsqueda, formato de tools OpenAIA/Groq (`Brain._tools_openai`), formateo del contexto prefetch, recorte de memoria por pares, dispatch de herramientas, el ciclo de `OpenCodeRunner` (confirmación, timeout, truncado) y el router (reglas, negación, extracción de slots, umbral de embeddings con encoder falso, formato de respuestas). Más el segundo plano: máquina de estados, cola, hotkeys, bandeja, wake word, capturador y grabación VAD (corte por silencio/tope/PTT, WAV en temp) con flujos E2E de `WAKE→transcripción` — todo mockeado, sin red ni descarga de modelos.
 - Verificación manual: `python -m pytest` y una corrida en modo texto preguntando clima/noticias/búsqueda.
 
 ---
@@ -418,4 +418,4 @@ Usuario: "Crea un skill de opencode para X en el proyecto briefing"
 ---
 
 **Última actualización**: Septiembre 2026
-**Versión**: 3.4.0 (segundo plano: wake word JARVIS sobre la máquina de estados + hotkeys + bandeja)
+**Versión**: 3.5.0 (segundo plano: wake word JARVIS + transcripción de voz por VAD sobre la máquina de estados + hotkeys + bandeja)
