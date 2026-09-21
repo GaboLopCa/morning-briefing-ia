@@ -1,125 +1,172 @@
 import os
-import sounddevice as sd
+import sys
+import time as time_mod
+
 import numpy as np
+import sounddevice as sd
+from google import genai
+from google.genai import types
 from scipy.io import wavfile
-from groq import Groq
+
+from config import (
+    DURACION_MAX_GRABACION,
+    MODELO_TRANSCRIPCION,
+    PAUSA_SILENCIO,
+    UMBRAL_MINIMO_RMS,
+    VOCABULARIO_PERSONAL,
+)
+
+
+def _abortar_por_tecla():
+    """Devuelve True si se pulsó ESC (solo Windows, con msvcrt)."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import msvcrt
+
+        if msvcrt.kbhit():
+            return ord(msvcrt.getch()) == 27
+    except ImportError:
+        pass
+    return False
+
 
 class AudioEar:
-    def __init__(self, api_key, sample_rate=16000):
-        self.client = Groq(api_key=api_key)
+    def __init__(
+        self,
+        api_key,
+        sample_rate=16000,
+        modelo_transcripcion=MODELO_TRANSCRIPCION,
+    ):
+        self.client = genai.Client(api_key=api_key)
+        self.modelo_transcripcion = modelo_transcripcion
         self.sample_rate = sample_rate
         self.temp_filename = "user_command.wav"
-        
-        # --- PARÁMETROS DE CALIBRACIÓN ACÚSTICA ---
-        self.threshold = 0.02        # Umbral de volumen (RMS). Menos de esto es silencio.
-        self.silence_limit = 1.5     # Segundos consecutivos de silencio antes de cortar.
-        self.chunk_size = 1024       # Tamaño de cada bloque de lectura (muestras).
+
+        self.threshold = 0.02
+        self.silence_limit = PAUSA_SILENCIO
+        self.chunk_size = 1024
+        self.max_duration = DURACION_MAX_GRABACION
+
+    # -------------------------------------------------------------- grabación
 
     def record_audio(self):
-        """Abre un stream continuo de audio y corta automáticamente al detectar silencio."""
-        print("🎙️ Josesito escuchando... Habla cuando quieras.")
-        
-        audio_frames = []
-        silence_counter = 0
-        has_spoken = False
-        
-        # Calculamos cuántos segundos representa cada 'chunk' en base al sample_rate
-        chunk_duration = self.chunk_size / self.sample_rate
+        """Graba mientras hay voz y corta por silencio, tiempo máximo o ESC.
 
-        # Abrimos el canal directo (Stream) con la tarjeta de sonido
-        # Usamos float32 porque normaliza la onda entre -1.0 y 1.0, facilitando el cálculo matemático
-        with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype='float32', blocksize=self.chunk_size) as stream:
+        Devuelve la ruta del WAV, o None si se abortó (ESC) o no se detectó voz.
+        """
+        print("🎙️ Josesito escuchando... Habla cuando quieras.")
+        audio_frames = []
+        silence_counter = 0.0
+        has_spoken = False
+        abortado = False
+        frames_leidos = 0
+
+        chunk_duration = self.chunk_size / self.sample_rate
+        max_chunks = int(self.max_duration / chunk_duration)
+
+        with sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="float32",
+            blocksize=self.chunk_size,
+        ) as stream:
             while True:
-                # 1. Leer un bloque de audio desde el hardware
                 data, overflowed = stream.read(self.chunk_size)
+                if overflowed:
+                    print("⚠️ overflow de micrófono (bloque perdido).")
                 audio_frames.append(data.copy())
-                
-                # 2. Calcular la energía del bloque actual (RMS)
-                rms = np.sqrt(np.mean(data**2))
-                
-                # 3. Lógica de la Máquina de Estados (VAD Casero)
+                frames_leidos += 1
+
+                rms = float(np.sqrt(np.mean(data**2)))
+
                 if rms > self.threshold:
                     if not has_spoken:
                         print("🗣️ ¡Voz detectada! Grabando...")
                         has_spoken = True
-                    silence_counter = 0  # Reseteamos el contador porque el usuario sigue hablando
-                else:
-                    if has_spoken:
-                        silence_counter += chunk_duration
-                
-                # 4. Condición de término: El usuario habló y luego se calló por el tiempo límite
+                    silence_counter = 0.0
+                elif has_spoken:
+                    silence_counter += chunk_duration
+
                 if has_spoken and silence_counter >= self.silence_limit:
                     print("🤫 Silencio detectado. Deteniendo grabación.")
                     break
-        
-        # Concatena todos los fragmentos leídos en un solo gran array de datos
+                if frames_leidos >= max_chunks:
+                    print("⏱️ Límite de duración alcanzado. Deteniendo grabación.")
+                    break
+                if _abortar_por_tecla():
+                    print("⛔ Abortado por teclado (ESC).")
+                    abortado = True
+                    break
+
+        if abortado or not has_spoken:
+            if not has_spoken:
+                print("⚠️ No se detectó voz útil.")
+            return None
+
         full_audio = np.concatenate(audio_frames, axis=0)
-        
-        # Para guardarlo como .wav estándar, transformamos los floats (-1 a 1) a enteros de 16 bits
-        audio_int16 = (full_audio * 32767).astype(np.int16)
-        
-        # Guardar a disco de forma física
+        audio_int16 = np.clip(full_audio * 32767, -32768, 32767).astype(np.int16)
         wavfile.write(self.temp_filename, self.sample_rate, audio_int16)
         return self.temp_filename
 
+    # ----------------------------------------------------------- transcripción
+
     def transcribe_audio(self, file_path):
-        """Manda el archivo generado a Whisper de Groq."""
+        """Transcribe un WAV con el modelo de transcripción de Gemini."""
         if not file_path or not os.path.exists(file_path):
             return ""
-
         try:
-            with open(file_path, "rb") as file:
-                transcription = self.client.audio.transcriptions.create(
-                    file=(file_path, file.read()),
-                    model="whisper-large-v3",
-                    prompt="Conversación informal con un asistente inteligente llamado Josesito. "
-                    "Se mencionan términos como Melipilla, El Bulla, Universidad de Chile, "
-                    "Groq, API, prompt, software engineering, Pokémon, F1, NBA y modismos chilenos como cachái o al tiro.",
-                    language="es"
-                )
-            os.remove(file_path)
-            return transcription.text
-        except Exception as e:
-            print(f"❌ Error en Whisper: {e}")
-            if os.path.exists(file_path): os.remove(file_path)
+            with open(file_path, "rb") as archivo:
+                audio_bytes = archivo.read()
+
+            response = self.client.models.generate_content(
+                model=self.modelo_transcripcion,
+                contents=[types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")],
+                config=types.GenerateContentConfig(
+                    audio_transcription_config=types.AudioTranscriptionConfig(
+                        language_codes=["es-CL"],
+                        custom_vocabulary=VOCABULARIO_PERSONAL,
+                    )
+                ),
+            )
+            return (getattr(response, "text", "") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            print(f"❌ Error en transcripción: {exc}")
             return ""
-        
+        finally:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
+
+    # ------------------------------------------------------- calibración ruido
+
     def calibrate_ambient_noise(self, duration=2.0):
-        """
-        Escucha el entorno durante un tiempo fijo para medir el ruido blanco base
-        y calcular un umbral (threshold) de activación dinámico.
-        """
+        """Mide el ruido ambiente y fija un umbral dinámico de activación."""
         print(f"🤫 Calibrando ruido ambiental por {duration} segundos. Guarda silencio...")
-        
+
         rms_values = []
-        
-        # Decisión de Diseño: Calculamos cuántos bloques (chunks) caben en la duración deseada.
-        # Si duration = 2s y sample_rate = 16000Hz, necesitamos 32,000 muestras en total.
-        # Dividido por chunk_size (1024), nos da aproximadamente 31 iteraciones en el bucle.
         total_chunks = int((duration * self.sample_rate) / self.chunk_size)
-        
-        # Abrimos el flujo de entrada de la tarjeta de sonido de forma idéntica a la grabación
-        with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype='float32', blocksize=self.chunk_size) as stream:
+
+        with sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="float32",
+            blocksize=self.chunk_size,
+        ) as stream:
             for _ in range(total_chunks):
-                data, overflowed = stream.read(self.chunk_size)
-                
-                # Calculamos la energía RMS de este bloque de "silencio"
-                rms = np.sqrt(np.mean(data**2))
+                data, _overflowed = stream.read(self.chunk_size)
+                rms = float(np.sqrt(np.mean(data**2)))
                 rms_values.append(rms)
-                
-        # Calculamos el promedio matemático de todo el ruido de fondo capturado
-        ambient_noise_average = np.mean(rms_values)
-        
-        # DECISIÓN DE INGENIERÍA (El Factor de Tolerancia):
-        # Si dejamos el threshold exactamente igual al ruido promedio, cualquier mínimo soplido o el eco
-        # de la pieza activaría la grabación. Multiplicarlo por 1.5 crea un "colchón de seguridad" ideal.
+                if _abortar_por_tecla():
+                    break
+
+        ambient_noise_average = float(np.mean(rms_values)) if rms_values else 0.0
         self.threshold = ambient_noise_average * 1.5
-        
-        # Guardafrenos (Safe Guard): Si tu habitación es extremadamente silenciosa, el RMS podría dar casi 0.
-        # Un umbral demasiado bajo causaría que el micrófono se active con el simple hecho de que respires.
-        if self.threshold < 0.005:
-            self.threshold = 0.005
-            
-        print(f"✅ Calibración completada con éxito:")
+        if self.threshold < UMBRAL_MINIMO_RMS:
+            self.threshold = UMBRAL_MINIMO_RMS
+
+        print(f"✅ Calibración completada:")
         print(f"   - Ruido base promedio: {ambient_noise_average:.5f}")
-        print(f"   - Umbral dinámico fijado en (Threshold): {self.threshold:.5f}\n")
+        print(f"   - Umbral dinámico fijado: {self.threshold:.5f}\n")

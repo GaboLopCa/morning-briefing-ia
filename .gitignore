@@ -130,6 +130,15 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# Audios temporales del asistente (por si queda residuo tras un crash)
+*.mp3
+*.wav
+speech_output.mp3
+user_command.wav
+
+# IDE
+.vscode/
 env/
 venv/
 ENV/

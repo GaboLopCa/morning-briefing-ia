@@ -1,6 +1,6 @@
 groq
 requests
-feedparser
+feedparser 
 ddgs
 edge-tts
 pygame

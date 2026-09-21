@@ -2,10 +2,10 @@
 
 ## 📋 Visión del Proyecto
 
-**Josesito Home Assistant** es un asistente personal inteligente de voz y texto, diseñado como un "briefing matutino" personalizado para Gabriel, estudiante de ingeniería de software. El sistema combina múltiples fuentes de información en tiempo real (clima, noticias, búsqueda web) con una personalidad única de presentador de radio chileno, satírico y directo, originario de Melipilla.
+**Josesito Home Assistant** es un asistente personal inteligente de voz y texto, diseñado como un "briefing matutino" personalizado para Gabriel, estudiante de ingeniería de software. El sistema combina múltiples fuentes de información en tiempo real (clima, noticias, búsqueda web) con una personalidad única de presentador de radio satírico y directo, originario de Melipilla, que habla en español neutro.
 
 ### Objetivo Principal
-Proporcionar un resumen diario personalizado y conversacional de información relevante, permitiendo interacción por voz o texto, con capacidades de búsqueda en tiempo real y memoria contextual.
+Proporcionar un resumen diario personalizado y conversacional de información relevante, permitiendo interacción por voz o texto, con capacidades de búsqueda en tiempo real, memoria contextual y delegación de tareas de programación vía opencode.
 
 ---
 
@@ -13,23 +13,48 @@ Proporcionar un resumen diario personalizado y conversacional de información re
 
 ### Patrón de Diseño: **Orquestación Modular con Pipeline Central**
 
-El sistema sigue una arquitectura de **microservicios locales** donde un orquestador central (`main.py`) coordina módulos especializados independientes.
+El sistema sigue una arquitectura de **microservicios locales** donde un orquestador central (`main.py`) coordina módulos especializados independientes, conectados mediante inyección de dependencias (DI).
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    main.py (Orquestador)                     │
 │  - Menú de selección de entrada (Texto/Micrófono)            │
+│  - DI: construye proveedores y los inyecta al registro       │
 │  - Ciclo de vida de la aplicación                            │
-│  - Coordinación de módulos                                   │
 └──────────┬──────────────────────────────────────────────────┘
            │
            ├──► modules/weather.py      (WeatherProvider)
            ├──► modules/news.py          (NewsFetcher)
            ├──► modules/search.py        (WebSearcher)
-           ├──► modules/summarizer.py    (NewsSummarizer)
+           ├──► modules/opencode_tool.py (OpenCodeRunner)
+           ├──► modules/summarizer.py    (Brain - motor Gemini Live)
            ├──► modules/voice.py         (VoiceAssistant)
            └──► modules/ear.py           (AudioEar)
 ```
+
+### Tool Registry (extensible)
+
+`modules/tools/registry.py` modela cada capacidad como una `Herramienta` (declaración JSON Schema para el LLM + handler local). El `Brain` no conoce las herramientas: delega el dispatch al registro. Para añadir una habilidad basta construir una `Herramienta` y registrarla.
+
+**Herramientas actuales:**
+
+| Nombre | Parámetros | Handler |
+|---|---|---|
+| `get_weather_data` | — | `WeatherProvider.get_weather()` |
+| `get_news_data` | — | `NewsFetcher.get_top_news()` |
+| `search_internet_data` | `query` (requerido) | `WebSearcher.search_internet(query)` |
+| `ejecutar_opencode` | `proyecto` (enum allowlist) + `peticion` (requeridos) | `OpenCodeRunner.ejecutar(...)` |
+
+### Contrato de Respuestas (envelope)
+
+Todos los módulos devuelven un envelope JSON-serializable (`modules/contract.py`):
+
+```json
+{"status": "ok",    "data": ...}
+{"status": "error", "mensaje": "texto genérico"}
+```
+
+Los `status: error` llegan al LLM como `{"result": {"status": "error", ...}}`; el detalle técnico va solo a consola, nunca al modelo.
 
 ### Flujo de Datos
 
@@ -39,38 +64,45 @@ ENTRADA (Texto/Mic)
         ▼
 ┌───────────────────────────────────────┐
 │   AudioEar (si es voz)                │
-│   - Grabación con VAD (RMS)           │
-│   - Transcripción con Whisper         │
+│   - VAD por RMS + calibración          │
+│   - Transcripción con Gemini           │
+│   (gemini-3.5-transcribe)              │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
-│   NewsSummarizer (Motor de IA)        │
-│   - Procesamiento con Llama 3.3 70B   │
-│   - Function Calling (Groq)           │
-│   - Memoria conversacional (12 turnos)│
+│   Brain (Motor de IA)                 │
+│   - Gemini 3.1 Flash (Live API)       │
+│   - Sesión por turno (WebSocket)      │
+│   - Tool calling vía registry         │
+│   - Memoria por pares user/model      │
 └───────────────┬───────────────────────┘
                 │
         ┌───────┴────────┐
         │                │
         ▼                ▼
-   [Tools]          [Chitchat]
+   [Tools libres]   [Chitchat]
         │                │
         ▼                ▼
 ┌──────────────┐  ┌──────────────┐
 │ WeatherProv  │  │ Respuesta    │
 │ NewsFetcher  │  │ directa      │
 │ WebSearcher  │  └──────┬───────┘
-└──────┬──────┘         │
+│ OpenCode     │         │
+└──────┬───────┘         │
        │                │
        └────────┬───────┘
                 ▼
        ┌────────────────┐
        │ VoiceAssistant │
        │ - Edge-TTS     │
-       │ - Síntesis voz │
+       │ - pygame mixer │
        └────────────────┘
 ```
+
+#### Sesión por turno (Live API)
+
+Cada consulta abre una sesión WebSocket propia: se siembra el historial (pares user/model) más el mensaje actual vía `send_client_content(turns=..., turn_complete=True)` con `history_config.initial_history_in_client_content=True`. Esto resuelve el bug histórico del trim del sliding window: **la memoria client-side solo contiene pares user/model**, recortada por turnos completos, sin mensajes `tool` huérfanos.
 
 ---
 
@@ -79,19 +111,14 @@ ENTRADA (Texto/Mic)
 ### 1. **WeatherProvider** (`modules/weather.py`)
 **Responsabilidad**: Obtención de datos meteorológicos en tiempo real.
 
-**Características**:
-- API: Open-Meteo (sin autenticación requerida)
-- Ubicación: Melipilla, Chile (-33.6895, -71.2146), coordenadas hardcodeadas en `main.py`
-- Datos proporcionados:
-  - Temperatura actual y sensación térmica
-  - Máxima y mínima del día
-  - Probabilidad de precipitación
-  - Condición del cielo (despejado, parcialmente nublado, nublado, lluvia) mapeada desde `weather_code`
+- API: Open-Meteo (sin autenticación)
+- Ubicación: Melipilla, Chile (`-33.6895, -71.2146`) — configuración en `config.py`
+- Campos: `max`, `min`, `current`, `feels_like`, `rain_prob`, `condition` (mapeo WMO a etiqueta en español: despejado / parcialmente nublado / niebla / lluvia / nieve / tormenta / nublado)
+- Timeout de red y errores envueltos en el envelope (`status: error`)
 
 **Interfaz**:
 ```python
-get_weather() -> dict
-# Retorna: {'max': float, 'min': float, 'current': float, 'feels_like': float, 'rain_prob': int, 'condition': str}
+get_weather() -> {"status": "ok", "data": {...}} | {"status": "error", "mensaje": str}
 ```
 
 ---
@@ -99,72 +126,63 @@ get_weather() -> dict
 ### 2. **NewsFetcher** (`modules/news.py`)
 **Responsabilidad**: Agregación de noticias desde múltiples fuentes RSS chilenas y latinoamericanas.
 
-**Características**:
-- 14 fuentes RSS configuradas en `main.py` (Biobío, La Tercera, El Mostrador, Cooperativa, ADN, BBC Mundo, Xataka, etc.)
-- Filtrado de noticias de las últimas 24 horas
-- Límite de 8 noticias por fuente para optimizar tokens
-- Descripciones truncadas a 200 caracteres
-- Pausas de 0.5s entre requests y timeout de 10s por fuente (evita error 10054)
-- User-Agent de navegador para evitar bloqueos
+- 13 fuentes RSS en `config.py` (Biobío, La Tercera, El Mostrador, Cooperativa, ADN, BBC Mundo, Xataka, etc.)
+- Filtrado **timezone-aware** (comparación en UTC, últimas 24 h); descarta sin fecha
+- **Descarga en paralelo** (ThreadPoolExecutor, `NOTICIAS_WORKERS=6`) con reintento simple ante `429/5xx`
+- **Mini-caché en memoria** (`NOTICIAS_CACHE_TTL=120` s): llamadas repetidas de la misma sesión no re-descargan feeds
+- **Dedup por título** entre fuentes
+- Capa global `MAX_NOTICIAS_TOTAL=40` **y** capa por fuente (`por_fuente=8`)
+- Descripciones truncadas a `DESCRIPCION_MAX=200` caracteres solo si realmente exceden
+- Timeout de 10 s y User-Agent de navegador
+- Fuentes que fallan se saltan sin romper el agregado
 
 **Interfaz**:
 ```python
-get_top_news() -> list[dict]
-# Retorna: [{'title': str, 'description': str, 'category': str}]
+get_top_news() -> {"status": "ok", "data": [{"title", "description", "category"}]} | error
 ```
 
 ---
 
 ### 3. **WebSearcher** (`modules/search.py`)
-**Responsabilidad**: Búsqueda en internet en tiempo real para información actualizada.
+**Responsabilidad**: Búsqueda en internet en tiempo real.
 
-**Características**:
-- Motor: DuckDuckGo (vía librería `ddgs`)
-- Región: Chile (`region="cl-es"`)
-- Sin API keys requeridas
-- Máximo 4 resultados por búsqueda
-- Formato estructurado en texto plano para facilitar su lectura por la IA
+- Motor: DuckDuckGo (vía `ddgs`), región Chile (`cl-es`)
+- Máx. 4 resultados; **dedup por título**; snippets truncados a `SNIPPET_MAX=300`
+- Bloque de texto plano estructurado para el LLM
 
 **Interfaz**:
 ```python
-search_internet(query: str, max_results: int = 4) -> str
-# Retorna: bloque de texto con títulos y fragmentos, o string de error
+search_internet(query: str) -> {"status": "ok", "data": str} | {"status": "error", "mensaje": str}
 ```
 
 ---
 
-### 4. **NewsSummarizer** (`modules/summarizer.py`)
-**Responsabilidad**: Motor cognitivo central con IA conversacional.
+### 4. **Brain** (`modules/summarizer.py`) — Motor cognitivo
+**Responsabilidad**: Conversación + orquestación de herramientas vía Gemini Live API.
 
-**Características**:
-- **Modelo**: Llama 3.3 70B Versatile (vía Groq API)
-- **Function Calling**: El LLM decide qué herramientas invocar (`tool_choice="auto"`)
-- **Herramientas disponibles**:
-  1. `get_weather_data()` - Clima actual
-  2. `get_news_data()` - Noticias RSS
-  3. `search_internet_data(query)` - Búsqueda web
-- **Memoria**: Sliding window de 12 turnos
-- **Personalidad**: Josesito, presentador satírico chileno
-- **Restricciones de salida**: 100% español, sin markdown ni formato especial (para que el TTS lo lea naturalmente)
-- **Errores de módulos**: se devuelven como strings dentro del JSON que recibe el LLM (no se lanzan excepciones)
+- **Modelo**: `gemini-3.1-flash-live-preview` (Live API WebSocket, sesión por turno)
+- **Modo de salida**: el modelo es *voice-first* (`response_modalities=["AUDIO"]`) y rechaza la modalidad TEXT; el texto de la respuesta se obtiene con `output_audio_transcription` (campo `output_transcription` en `server_content`), que llega en varios chunks que se concatenan
+- **Tool calling**: el modelo decide qué herramienta llamar; el `Brain` resuelve el `FunctionResponse` y recibe el texto final del mismo turno de sesión
+- **Memoria**: pares user/model limitados a `MAX_HISTORIAL_TURNOS=12`, recorte por turnos completos
+- **Config Live**: `response_modalities=["AUDIO"]` + `output_audio_transcription` (es-CL), `thinking_level="LOW"`, temperatura 0.7, máx 1024 tokens
+- **Personalidad**: Josesito, presentador satírico, irónico y directo, originario de Melipilla, hablando en **español neutro** (sin modismos chilenos) para que el TTS lo lea naturalmente
+- **Sin markdown** en la salida (para que el TTS la lea naturalmente)
 
 **Interfaz**:
 ```python
-generate_response(weather_provider, news_fetcher, search_provider, user_command) -> str
+Brain(api_key, registro) -> generate_response(user_command: str) -> str
+Brain(...) -> limpiar_historial() -> None
 ```
 
 ---
 
 ### 5. **VoiceAssistant** (`modules/voice.py`)
-**Responsabilidad**: Síntesis de voz y reproducción de respuestas.
+**Responsabilidad**: Síntesis de voz y reproducción.
 
-**Características**:
-- Motor: Edge-TTS (Microsoft Neural TTS)
-- Voz: `es-CL-LorenzoNeural` (español chileno masculino)
-- Velocidad configurable (default: 1.2x)
-- Limpieza de texto (URLs, asteriscos, hashtags) antes de sintetizar
-- Reproducción con pygame mixer
-- Archivo temporal `speech_output.mp3` eliminado tras la reproducción
+- Motor Edge-TTS, voz `es-CL-LorenzoNeural`, velocidad 1.2x
+- Limpieza de texto (URLs, asteriscos, hashtags)
+- `pygame.mixer` con inicialización **perezosa y tolerante a fallos** (sin audio → responde solo por texto)
+- MP3 temporal en `tempfile.gettempdir()` (`speech_<pid>.mp3`), eliminado en `finally` — no deja residuos en el cwd
 
 **Interfaz**:
 ```python
@@ -174,300 +192,182 @@ speak(text: str) -> None
 ---
 
 ### 6. **AudioEar** (`modules/ear.py`)
-**Responsabilidad**: Captura de audio, procesamiento de voz y transcripción.
+**Responsabilidad**: Captura de audio y transcripción.
 
-**Características**:
-- **VAD (Voice Activity Detection)**: Casero basado en RMS
-- **Grabación**: Stream continuo con detección automática de silencio
-- **Calibración dinámica**: Ajusta umbral según ruido ambiental (factor de seguridad x1.5, mínimo 0.005)
-- **Transcripción**: Whisper Large V3 (vía Groq API)
-- **Parámetros configurables**:
-  - `threshold`: 0.02 inicial (ajustado en calibración)
-  - `silence_limit`: 1.5 segundos
-  - `chunk_size`: 1024 muestras
-  - `sample_rate`: 16000 Hz
-- Archivo temporal `user_command.wav` eliminado tras la transcripción
+- VAD casero por RMS + calibración dinámica de ruido (x1.5, mínimo `UMBRAL_MINIMO_RMS`)
+- Cortes por silencio (1.5 s), **tope de seguridad de 30 s**, y aborte por **ESC** (con `msvcrt`, solo Windows)
+- WAV a 16 kHz en int16, `np.clip` para evitar saturación
+- **Transcripción**: Gemini `gemini-3.5-transcribe`, con `AudioTranscriptionConfig(language_codes=["es-CL"], custom_vocabulary=...)`
+- WAV temporal eliminado en `finally`
 
 **Interfaz**:
 ```python
-record_audio() -> str  # Retorna path del archivo WAV
+record_audio() -> str | None      # ruta WAV, o None si se abortó / no hubo voz
 transcribe_audio(file_path: str) -> str
 calibrate_ambient_noise(duration: float = 2.0) -> None
 ```
 
 ---
 
+### 7. **OpenCodeRunner** (`modules/opencode_tool.py`)
+**Responsabilidad**: Delegar tareas de programación al CLI `opencode` en los proyectos locales del usuario.
+
+- Ejecuta `opencode run --dir <ruta> "<petición>"` via `subprocess` (sin `--auto`)
+- **Confirmación humana obligatoria**: llamada a un callback (en `main.py` es un `input(¿Confirmas? s/N)`)
+- **Allowlist**: `OPENCODE_PROYECTOS` en `config.py` — el modelo solo elige un *nombre*, nunca una ruta arbitraria
+- Timeout de 300 s, ventana de consola oculta en Windows (`CREATE_NO_WINDOW`), salida truncada a 4000 caracteres, encoding UTF-8
+
+**Interfaz**:
+```python
+OpenCodeRunner(confirmador=fn) -> ejecutar(*, proyecto: str, peticion: str) -> envelope
+```
+
+---
+
 ## 🔄 Modos de Operación
 
-Al iniciar, `main.py` muestra un menú interactivo (`seleccionar_modo_interfaz()`) para elegir la entrada. No existe una constante de configuración; la selección se hace en cada ejecución.
+Al iniciar, `main.py` muestra un menú interactivo (`seleccionar_modo_interfaz()`). No existe una constante; la selección se hace en cada ejecución.
 
 ### Opción 1: **Modo Texto**
 - Entrada por consola con prompt `Gabriel >>>`
 - Comandos de salida: `exit`, `quit`, `salir`
-- Ideal para entornos silenciosos (clases, oficinas)
 - Multiplataforma (no requiere `msvcrt`)
+- Si `BRIEFING_POR_VOZ` está en `True` (config), la respuesta además se lee por voz
 
 ### Opción 2: **Modo Micrófono**
-- Entrada por voz con detección automática de actividad (VAD por RMS)
-- Calibración inicial de ruido ambiental (2 segundos)
-- Controles:
-  - **ESPACIO**: Iniciar grabación
-  - **ESC**: Apagar sistema
-- **Solo Windows**: usa el teclado nativo `msvcrt`
-- Una vez transcrito el audio, el pipeline de procesamiento es idéntico al modo texto
+- Entrada por voz con VAD por RMS
+- Calibración inicial de ruido (2 s)
+- Controles: **ESPACIO** graba, **ESC** apaga
+- **Solo Windows** (`msvcrt`); en otra plataforma el wizard aborta el arranque con mensaje claro
 
 ---
 
 ## 🛠️ Stack Tecnológico
 
-### Lenguaje
-- **Python 3.8+**
-
-### Dependencias Principales (`requirements.txt`)
+### Dependencias (`requirements.txt`, pineadas con `==`)
 ```
-groq                # API de Llama (LLM) y Whisper (STT)
-requests            # HTTP requests para APIs y RSS
-feedparser          # Parsing de feeds RSS
-ddgs                # Búsqueda web DuckDuckGo
-edge-tts            # Síntesis de voz neural
-pygame              # Reproducción de audio
-sounddevice         # Captura de audio desde micrófono
-numpy               # Procesamiento de señales (RMS)
-scipy               # Escritura de archivos WAV
-python-dotenv       # Gestión de variables de entorno
+google-genai==2.24.0   # Gemini Live API (LLM) y transcripción
+requests               # HTTP para APIs y RSS
+feedparser             # Parsing de feeds RSS
+ddgs                   # Búsqueda web DuckDuckGo
+edge-tts               # Síntesis de voz neural
+pygame                 # Reproducción de audio
+sounddevice            # Captura de audio desde micrófono
+numpy                  # Procesamiento de señales (RMS)
+scipy                  # Escritura de archivos WAV
+python-dotenv          # Variables de entorno
+websockets             # Transporte de la Live API
+pytest                 # Tests
 ```
 
 ### APIs Externas
-1. **Groq API** (IA y transcripción)
-   - Modelo LLM: `llama-3.3-70b-versatile`
-   - Modelo STT: `whisper-large-v3`
-   - API Key: Variable de entorno `GROQ_API_KEY`
-
-2. **Open-Meteo API** (Clima)
-   - Sin autenticación
-   - Endpoint: `https://api.open-meteo.com/v1/forecast`
-
-3. **Edge-TTS** (Voz)
-   - Servicio gratuito de Microsoft
-   - Sin API key requerida
-
-4. **DuckDuckGo** (Búsqueda)
-   - Sin API key requerida
-   - Región: Chile (`cl-es`)
-
----
-
-## 📊 Estado de Desarrollo
-
-### Funcionalidades Implementadas ✅
-
-- [x] **Arquitectura modular completa** con 6 módulos especializados
-- [x] **Dual mode de entrada**: Texto y Micrófono con VAD
-- [x] **Motor de IA conversacional** con Llama 3.3 70B
-- [x] **Function Calling** para herramientas externas
-- [x] **Memoria contextual** con sliding window (12 turnos)
-- [x] **Personalidad definida** (Josesito, presentador chileno)
-- [x] **Agregación de noticias** desde 14 fuentes RSS chilenas
-- [x] **Búsqueda web en tiempo real** con DuckDuckGo
-- [x] **Síntesis de voz** en español chileno (Edge-TTS)
-- [x] **Transcripción de voz** con Whisper Large V3
-- [x] **Calibración dinámica** de ruido ambiental
-- [x] **VAD casero** basado en RMS
-- [x] **Manejo de errores** robusto en todos los módulos
-- [x] **Variables de entorno** para configuración segura
-
-### Roadmap / En Desarrollo 🚧
-
-- [ ] **Persistencia de memoria** (actualmente solo en sesión)
-- [ ] **Historial de conversaciones** en base de datos
-- [ ] **Configuración de ubicación** dinámica (no hardcodeada)
-- [ ] **Soporte multi-usuario** (perfiles personalizados)
-- [ ] **Integración con calendarios** (Google Calendar, Outlook)
-- [ ] **Recordatorios y alarmas** inteligentes
-- [ ] **Control de dispositivos smart home**
-- [ ] **API REST** para integración con otras aplicaciones
-- [ ] **Dockerización** del proyecto
-- [ ] **Tests unitarios** y de integración
-- [ ] **Logs estructurados** para debugging
-- [ ] **Métricas y analytics** de uso
-
-### Bugs Conocidos 🐛
-
-- Dependencia de `msvcrt` limita el modo micrófono a Windows
-- Archivos temporales de audio (`speech_output.mp3`, `user_command.wav`) pueden dejar residuos si hay crashes (no están gitignored)
+1. **Gemini (Google AI Studio)** — LLM Live y transcripción
+   - Modelos: `gemini-3.1-flash-live-preview` (LLM) y `gemini-3.5-transcribe` (STT)
+   - API Key: variable de entorno `GOOGLE_API_KEY`
+2. **Open-Meteo API** (clima, sin auth)
+3. **Edge-TTS** (voz, sin key)
+4. **DuckDuckGo** (búsqueda, sin key)
+5. **opencode CLI** (local) para `ejecutar_opencode`
 
 ---
 
 ## 🚀 Instalación y Configuración
 
 ### Prerrequisitos
-- Python 3.8 o superior
-- Windows 10/11 (para modo micrófono con `msvcrt`)
-- Micrófono (opcional, para modo voz)
-- API Key de Groq (https://console.groq.com/)
+- Python 3.8+
+- Windows 10/11 (modo micrófono)
+- API Key de Gemini (Google AI Studio)
+- `opencode` en el PATH (solo para la tool `ejecutar_opencode`)
 
-### Pasos de Instalación
+### Pasos
 
 ```bash
-# 1. Clonar el repositorio
-git clone <repository-url>
-cd morning-briefing-ia
-
-# 2. Crear entorno virtual
+# 1. Crear entorno virtual
 python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # Linux/Mac
+venv\Scripts\activate  # Windows (source venv/bin/activate en Linux/Mac)
 
-# 3. Instalar dependencias
+# 2. Instalar dependencias (pinneadas)
 pip install -r requirements.txt
 
-# 4. Configurar variables de entorno
-# Crear archivo .env en la raíz del proyecto
-echo GROQ_API_KEY=tu_clave_aqui > .env
+# 3. Crear el .env con tu clave de Gemini
+# (Google AI Studio -> Get API key -> Create key)
+echo GOOGLE_API_KEY=tu_clave_aqui > .env
 
-# 5. Ejecutar el asistente
+# 4. Ejecutar
 python main.py
 ```
 
-> Nota: `main.py` importa los módulos como namespace package (no hay `__init__.py`); ejecuta siempre desde la raíz del proyecto.
+### Tests
+
+```bash
+python -m pytest -q
+```
+
+> Nota: `main.py` importa `modules.*` como namespace package; ejecuta siempre desde la raíz del proyecto.
 
 ### Configuración de `.env`
 ```env
-GROQ_API_KEY=tu_clave_de_groq_aqui
+GOOGLE_API_KEY=tu_clave_de_gemini
 ```
 
 ---
 
 ## 🎯 Casos de Uso
 
-### 1. Briefing Matutino
 ```
 Usuario: "Buenos días Josesito, ¿qué hay para hoy?"
-Josesito: [Proporciona clima, noticias destacadas y eventos relevantes]
-```
-
-### 2. Consulta de Clima
-```
 Usuario: "¿Cómo está el clima en Melipilla?"
-Josesito: "En Melipilla hay 18 grados, se siente como 16, cielo despejado.
-           Máxima de 22, mínima de 14, sin probabilidad de lluvia."
-```
-
-### 3. Noticias Deportivas
-```
 Usuario: "¿Qué pasó con la U ayer?"
-Josesito: [Busca noticias recientes y proporciona resumen satírico]
-```
-
-### 4. Búsqueda en Tiempo Real
-```
 Usuario: "¿Cuándo es el próximo partido de la Roja?"
-Josesito: [Busca en internet y proporciona información actualizada]
+Usuario: "Crea un skill de opencode para X en el proyecto briefing"
 ```
 
 ---
 
 ## 🧪 Testing
 
-### Pruebas Manuales Recomendadas
-
-1. **Modo Texto (opción 1)**:
-   - Saludos casuales ("Hola", "¿Cómo estás?")
-   - Consulta de clima
-   - Solicitud de noticias
-   - Búsqueda web ("¿Noticias de F1?")
-   - Chitchat con memoria ("¿Recuerdas mi nombre?")
-
-2. **Modo Micrófono (opción 2, Windows)**:
-   - Calibración de ruido ambiental
-   - Activación por voz (VAD)
-   - Transcripción precisa
-   - Detección de silencio
-   - Comandos por teclado (ESPACIO, ESC)
-
-3. **Casos Edge**:
-   - Sin conexión a internet
-   - API Key inválida
-   - Micrófono no disponible
-   - Respuestas largas (memoria)
-
----
-
-## 📈 Métricas de Performance
-
-### Optimizaciones Implementadas
-- **Límite de noticias**: 8 por fuente para controlar tokens
-- **Pausas entre requests**: 0.5s y timeout 10s para evitar rate limits / error 10054
-- **Sliding window**: Memoria limitada a 12 turnos
-- **Filtrado temporal**: Solo noticias de últimas 24h
-- **Truncado de descripciones**: 200 caracteres por noticia
-- **Limpieza de texto**: Reduce tokens en síntesis de voz
-- **Temperatura LLM**: 0.6 en primera llamada, 0.7 en la segunda (balance creatividad/coherencia)
-
-### Costos (Groq)
-- **Pago por uso**: tarifas vigentes en https://console.groq.com/pricing
-- **Uso personal típico**: del orden de $5-15 USD al mes con uso moderado
+- **53 tests** en `tests/` (`test_weather.py`, `test_news.py`, `test_search.py`, `test_tools_registry.py`, `test_brain.py`, `test_opencode_tool.py`).
+- Cubren: mapeo WMO, filtro de 24 h y caps de noticias, dedup de búsqueda, formato de declaración Live (validado offline contra el `LiveConnectConfig` del SDK), recorte de memoria por pares, dispatch de herramientas y el ciclo de `OpenCodeRunner` (confirmación, timeout, truncado) — todo mockeado, sin red.
+- Verificación manual: `python -m pytest` y una corrida en modo texto preguntando clima/noticias/búsqueda.
 
 ---
 
 ## 🔒 Seguridad
 
-- API Key almacenada en variables de entorno (no en código)
-- No se almacenan datos sensibles en disco
-- Transcripciones de audio se eliminan después de procesamiento
-- Archivos temporales de voz se limpian automáticamente
-- Sin envío de datos a servicios no autorizados
-
----
-
-## 👤 Perfil de Usuario
-
-**Nombre**: Gabriel
-**Rol**: Estudiante de Ingeniería de Software
-**Intereses**:
-- Tecnología y programación
-- Deportes (Universidad de Chile, F1, NBA)
-- Videojuegos
-- Modismos chilenos
-
-**Ubicación**: Melipilla, Chile
+- API Key solo en `.env` (gitignored)
+- `ejecutar_opencode` exige confirmación humana y allowlist de proyectos
+- Errores internos nunca se exponen al LLM (solo mensaje genérico)
+- Audios corruptos/estrías: archivos temporales se eliminan en `finally`
 
 ---
 
 ## 📝 Notas de Desarrollo
 
 ### Decisiones de Diseño
-
-1. **Groq sobre OpenAI**: Mayor velocidad de inferencia y menor costo
-2. **Edge-TTS sobre otras soluciones**: Gratuito, voz natural en español chileno
-3. **VAD casero sobre librerías externas**: Sin dependencias adicionales, suficiente para uso personal
-4. **RSS sobre APIs de noticias**: Sin límites de rate, fuentes curadas localmente
-5. **DuckDuckGo sobre Google**: Sin API key, respeto a privacidad
-6. **Memoria en memoria**: Simplicidad sobre persistencia (fase actual)
-7. **Errores como datos**: Los módulos devuelven strings de error dentro del JSON al LLM (no excepciones), manteniendo el contrato de function calling estable
+1. **Gemini Live API por turno** sobre sesión persistente: aislamiento, sin estado web de larga vida, y memoria seed explícita
+2. **Registry declarativo** sobre dispatch manual: añadir una tool = una `Herramienta`, sin tocar `Brain`
+3. **Envelope `{status, data|mensaje}`** como contrato único: el LLM siempre recibe datos o un mensaje parseable
+4. **Recorte por pares** resolvió el bug del trim impreciso (tool calls huérfanas)
+5. **Edge-TTS + pygame lazy**: gratuito y sin dependencia de audio si se corre headless
+6. **opencode con confirmación + allowlist**: la única tool con efectos sobre el sistema de archivos
 
 ### Limitaciones Conocidas
-
-- Modo micrófono solo funciona en Windows (`msvcrt`)
+- Modo micrófono solo en Windows (`msvcrt`)
 - Memoria no persiste entre sesiones
-- No soporta múltiples usuarios
-- Personalidad fija (no configurable por usuario)
-- Sin interfaz gráfica (solo consola)
-- El trim de la sliding window asume 1 user + 1 assistant por turno; con tool calls el historial crece más y el recorte queda impreciso
+- Sin interfaz gráfica
+- `ejecutar_opencode` depende de que el CLI `opencode` esté autenticado en el equipo
 
 ---
 
 ## 🔗 Referencias
 
-- [Groq API Documentation](https://console.groq.com/docs)
-- [Groq Pricing](https://console.groq.com/pricing)
-- [Llama 3.3 Model Card](https://huggingface.co/meta-llama/Llama-3.3-70B)
+- [Gemini Live API docs](https://ai.google.dev/gemini-api/docs/live)
+- [Google AI Python SDK (google-genai)](https://github.com/googleapis/python-genai)
 - [Edge-TTS](https://github.com/rany2/edge-tts)
 - [Open-Meteo API](https://open-meteo.com/en/docs)
-- [ddgs (DuckDuckGo Search en Python)](https://github.com/fourleif/ddgs)
-- [OpenAI Whisper Large V3](https://huggingface.co/openai/whisper-large-v3)
+- [ddgs (DuckDuckGo Search)](https://github.com/fourleif/ddgs)
 
 ---
 
 **Última actualización**: Septiembre 2026
-**Versión**: 1.1.0
+**Versión**: 2.0.0

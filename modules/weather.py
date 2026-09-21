@@ -1,7 +1,36 @@
 import requests
 
+from config import TIMEOUT_HTTP
+from modules.contract import error, ok
+
+
+def mapear_condicion(w_code):
+    """Traduce el código meteorológico WMO a una etiqueta en español.
+
+    Rangos oficiales:
+      0            despejado
+      1-3          parcialmente nublado
+      45, 48       niebla
+      51-67, 80-82 lluvia
+      71-77, 85-86 nieve
+      95-99        tormenta
+    """
+    if w_code == 0:
+        return "despejado"
+    if w_code <= 3:
+        return "parcialmente nublado"
+    if w_code in (45, 48):
+        return "con niebla"
+    if 51 <= w_code <= 67 or 80 <= w_code <= 82:
+        return "con lluvia"
+    if 71 <= w_code <= 77 or w_code in (85, 86):
+        return "con nieve"
+    if 95 <= w_code <= 99:
+        return "con tormenta"
+    return "nublado"
+
+
 class WeatherProvider:
-    
     def __init__(self, latitude, longitude):
         self.latitude = latitude
         self.longitude = longitude
@@ -11,38 +40,25 @@ class WeatherProvider:
         parameters = {
             "latitude": self.latitude,
             "longitude": self.longitude,
-            "current": ["temperature_2m", "apparent_temperature", "weather_code"], # Info actual
+            "current": ["temperature_2m", "apparent_temperature", "weather_code"],
             "daily": ["temperature_2m_max", "temperature_2m_min", "precipitation_probability_max"],
-            "timezone": "auto"
+            "timezone": "auto",
         }
-        try: 
-            response = requests.get(self.url_api, params=parameters)
+        try:
+            response = requests.get(self.url_api, params=parameters, timeout=(5, TIMEOUT_HTTP))
             response.raise_for_status()
             json_data = response.json()
 
-            # Datos actuales
-            current_temp = json_data["current"]["temperature_2m"]
-            feels_like = json_data["current"]["apparent_temperature"]
-            w_code = json_data["current"]["weather_code"]
-
-            # Datos diarios
-            temp_max = json_data["daily"]["temperature_2m_max"][0]
-            temp_min = json_data["daily"]["temperature_2m_min"][0]
             rain_prob = json_data["daily"]["precipitation_probability_max"][0]
-
-            # Diccionario de códigos básicos para que la IA entienda el cielo
-            # 0: Despejado, 1-3: Parcial/Nublado, 45-48: Niebla, 51+: Lluvia/Nieve
-            sky_condition = "despejado" if w_code == 0 else "parcialmente nublado" if w_code <= 3 else "nublado o con neblina"
-            if w_code > 50: sky_condition = "con lluvia"
-
-            return {
-                "max": temp_max,
-                "min": temp_min,
-                "current": current_temp,
-                "feels_like": feels_like,
+            clima = {
+                "max": json_data["daily"]["temperature_2m_max"][0],
+                "min": json_data["daily"]["temperature_2m_min"][0],
+                "current": json_data["current"]["temperature_2m"],
+                "feels_like": json_data["current"]["apparent_temperature"],
                 "rain_prob": rain_prob,
-                "condition": sky_condition
+                "condition": mapear_condicion(json_data["current"]["weather_code"]),
             }
-
-        except Exception as e:
-            return f"Error al obtener el clima: {e}"
+            return ok(clima)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WeatherProvider] Error interno: {exc}")
+            return error("No fue posible obtener el clima en este momento.")

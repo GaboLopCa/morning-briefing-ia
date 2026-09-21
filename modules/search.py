@@ -1,35 +1,33 @@
 from ddgs import DDGS
 
-class WebSearcher:
-    def __init__(self):
-        # No necesitamos llaves de API ni credenciales aquí. Gratis y libre.
-        pass
+from config import SNIPPET_MAX
+from modules.contract import error, ok
 
-    def search_internet(self, query, max_results=4):
-        """
-        Busca en internet la consulta solicitada y devuelve un resumen
-        en texto plano con los títulos y fragmentos encontrados.
-        """
+
+class WebSearcher:
+    def __init__(self, max_results=4):
+        self.max_results = max_results
+
+    def search_internet(self, query):
+        """Busca en DDG con región chilena y devuelve un bloque de texto plano."""
         try:
-            # Instanciamos el buscador nativo de la librería
             with DDGS() as ddgs:
-                # Usamos text() para buscar páginas web estándar.
-                # region="cl-es" le dice a DuckDuckGo que priorice resultados de Chile en español.
-                results = ddgs.text(query, region="cl-es", max_results=max_results)
-                
-                if not results:
-                    return f"No se encontraron resultados en internet para: '{query}'"
-                
-                # Vamos a empaquetar los resultados en un solo string limpio
-                context_string = "RESULTADOS ENCONTRADOS EN INTERNET:\n"
-                for index, result in enumerate(results, 1):
-                    title = result.get('title', 'Sin título')
-                    snippet = result.get('body', 'Sin descripción')
-                    
-                    # Estructuramos el texto para que Llama lo entienda fácilmente
-                    context_string += f"[{index}] Fuente: {title}\n    Información: {snippet}\n\n"
-                    
-                return context_string
-                
-        except Exception as e:
-            return f"Error físico al buscar en internet: {e}"
+                results = ddgs.text(query, region="cl-es", max_results=self.max_results)
+
+            if not results:
+                return ok(f"No se encontraron resultados en internet para: '{query}'")
+
+            contexto = ["RESULTADOS ENCONTRADOS EN INTERNET:"]
+            vistos = set()
+            for indice, resultado in enumerate(results, 1):
+                titulo = str(resultado.get("title", "") or "Sin título").strip()
+                if titulo in vistos:
+                    continue
+                vistos.add(titulo)
+                snippet = " ".join(str(resultado.get("body", "") or "").split())[:SNIPPET_MAX]
+                contexto.append(f"[{indice}] Fuente: {titulo}\n    Información: {snippet}")
+
+            return ok("\n\n".join(contexto))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WebSearcher] Error interno: {exc}")
+            return error("No fue posible realizar la búsqueda en internet.")
