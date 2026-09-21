@@ -21,7 +21,7 @@ class Herramienta:
     requerido: List[str] = field(default_factory=list)
 
     def a_declaracion(self) -> Dict[str, Any]:
-        """Convierte la tool al formato `FunctionDeclaration` de la Gemini Live API."""
+        """Convierte la tool al `FunctionDeclaration` plano ({name, description, parameters})."""
         declaracion: Dict[str, Any] = {
             "name": self.nombre,
             "description": self.descripcion,

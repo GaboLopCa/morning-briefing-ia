@@ -27,7 +27,7 @@ El sistema sigue una arquitectura de **microservicios locales** donde un orquest
            ├──► modules/news.py          (NewsFetcher)
            ├──► modules/search.py        (WebSearcher)
            ├──► modules/opencode_tool.py (OpenCodeRunner)
-           ├──► modules/summarizer.py    (Brain - motor Gemini Live)
+           ├──► modules/summarizer.py    (Brain - motor Groq streaming)
            ├──► modules/voice.py         (VoiceAssistant)
            └──► modules/ear.py           (AudioEar)
 ```
@@ -65,16 +65,16 @@ ENTRADA (Texto/Mic)
 ┌───────────────────────────────────────┐
 │   AudioEar (si es voz)                │
 │   - VAD por RMS + calibración          │
-│   - Transcripción con Gemini           │
-│   (gemini-3.5-transcribe)              │
+│   - Transcripción con Whisper (Groq)  │
+│   (whisper-large-v3-turbo)            │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
 │   Brain (Motor de IA)                 │
-│   - Gemini 3.1 Flash (Live API)       │
-│   - Sesión por turno (WebSocket)      │
-│   - Tool calling vía registry         │
+│   - Qwen 3.8 27B (Groq, streaming)    │
+│   - Prefetch clima/noticias por turno │
+│   - Tool calling vía registry (AFC)   │
 │   - Memoria por pares user/model      │
 └───────────────┬───────────────────────┘
                 │
@@ -100,9 +100,9 @@ ENTRADA (Texto/Mic)
        └────────────────┘
 ```
 
-#### Sesión por turno (Live API)
+#### Respuesta por turno (texto streaming)
 
-Cada consulta abre una sesión WebSocket propia: se siembra el historial (pares user/model) más el mensaje actual vía `send_client_content(turns=..., turn_complete=True)` con `history_config.initial_history_in_client_content=True`. Esto resuelve el bug histórico del trim del sliding window: **la memoria client-side solo contiene pares user/model**, recortada por turnos completos, sin mensajes `tool` huérfanos.
+Cada turno envía el historial (pares user/model) más el mensaje actual como `contents` en una llamada `generate_content_stream` (sin sesión persistente remota). Clima y noticias se **pre-buscan en paralelo** y se inyectan como bloque `CONTEXTO DEL DÍA` antes del mensaje del usuario: el modelo no gasta un round-trip en obtenerlos. Si decide llamar otra tool (búsqueda, opencode), el `Brain` resuelve el function call y re-alimenta el stream. La memoria client-side solo contiene pares user/model, recortada por turnos completos, sin mensajes `tool` huérfanos. El texto fluye al usuario apenas llega (`on_fragment`).
 
 ---
 
@@ -158,19 +158,21 @@ search_internet(query: str) -> {"status": "ok", "data": str} | {"status": "error
 ---
 
 ### 4. **Brain** (`modules/summarizer.py`) — Motor cognitivo
-**Responsabilidad**: Conversación + orquestación de herramientas vía Gemini Live API.
+**Responsabilidad**: Conversación + orquestación de herramientas vía Groq (chat completions streaming).
 
-- **Modelo**: `gemini-3.1-flash-live-preview` (Live API WebSocket, sesión por turno)
-- **Modo de salida**: el modelo es *voice-first* (`response_modalities=["AUDIO"]`) y rechaza la modalidad TEXT; el texto de la respuesta se obtiene con `output_audio_transcription` (campo `output_transcription` en `server_content`), que llega en varios chunks que se concatenan
-- **Tool calling**: el modelo decide qué herramienta llamar; el `Brain` resuelve el `FunctionResponse` y recibe el texto final del mismo turno de sesión
+- **Modelo**: `qwen/qwen3.8-27b` vía SDK `groq` (endpoint OpenAI-compatible); texto plano fluido, sin síntesis de audio previa
+- **Prefetch**: clima y noticias se obtienen en paralelo al inicio del turno y entran como mensaje `CONTEXTO DEL DÍA` (el modelo NO llama `get_weather_data`/`get_news_data`)
+- **Tool calling**: AFC manual con mensajes `role:"tool"` de re-alimentación (hasta `MAX_RONDAS_TOOLS=3`); tools se resuelven en `ThreadPoolExecutor`
+- **Retries**: reintentos con backoff solo ante `429/5xx` (`_es_reintentable`), respetando `retry-after`
+- **Fallback**: si el modelo no llega a redactar la respuesta final tras usar una tool, se devuelve un resumen legible de lo que la tool devolvió
 - **Memoria**: pares user/model limitados a `MAX_HISTORIAL_TURNOS=12`, recorte por turnos completos
-- **Config Live**: `response_modalities=["AUDIO"]` + `output_audio_transcription` (es-CL), `thinking_level="LOW"`, temperatura 0.7, máx 1024 tokens
+- **Streaming**: `generate_response(..., on_fragment=fn)` emite cada fragmento de texto apenas llega (latencia percibida ≈ primer token; Groq entrega el primer token en fracciones de segundo)
+- **Config**: temperatura 0.7, máx 1024 tokens, sin markdown en la salida
 - **Personalidad**: Josesito, presentador satírico, irónico y directo, originario de Melipilla, hablando en **español neutro** (sin modismos chilenos) para que el TTS lo lea naturalmente
-- **Sin markdown** en la salida (para que el TTS la lea naturalmente)
 
 **Interfaz**:
 ```python
-Brain(api_key, registro) -> generate_response(user_command: str) -> str
+Brain(api_key, registro) -> generate_response(user_command: str, on_fragment=None) -> str
 Brain(...) -> limpiar_historial() -> None
 ```
 
@@ -197,7 +199,7 @@ speak(text: str) -> None
 - VAD casero por RMS + calibración dinámica de ruido (x1.5, mínimo `UMBRAL_MINIMO_RMS`)
 - Cortes por silencio (1.5 s), **tope de seguridad de 30 s**, y aborte por **ESC** (con `msvcrt`, solo Windows)
 - WAV a 16 kHz en int16, `np.clip` para evitar saturación
-- **Transcripción**: Gemini `gemini-3.5-transcribe`, con `AudioTranscriptionConfig(language_codes=["es-CL"], custom_vocabulary=...)`
+- **Transcripción**: Groq Whisper `whisper-large-v3-turbo` (`client.audio.transcriptions.create(file=..., language="es", response_format="text")`)
 - WAV temporal eliminado en `finally`
 
 **Interfaz**:
@@ -246,7 +248,7 @@ Al iniciar, `main.py` muestra un menú interactivo (`seleccionar_modo_interfaz()
 
 ### Dependencias (`requirements.txt`, pineadas con `==`)
 ```
-google-genai==2.24.0   # Gemini Live API (LLM) y transcripción
+groq==1.2.0               # LLM streaming + transcripción Whisper (GPT / Groq)
 requests               # HTTP para APIs y RSS
 feedparser             # Parsing de feeds RSS
 ddgs                   # Búsqueda web DuckDuckGo
@@ -256,14 +258,14 @@ sounddevice            # Captura de audio desde micrófono
 numpy                  # Procesamiento de señales (RMS)
 scipy                  # Escritura de archivos WAV
 python-dotenv          # Variables de entorno
-websockets             # Transporte de la Live API
 pytest                 # Tests
 ```
 
 ### APIs Externas
-1. **Gemini (Google AI Studio)** — LLM Live y transcripción
-   - Modelos: `gemini-3.1-flash-live-preview` (LLM) y `gemini-3.5-transcribe` (STT)
-   - API Key: variable de entorno `GOOGLE_API_KEY`
+1. **Groq (consola gratuita, sin tarjeta)** — LLM y transcripción
+   - Modelos: `qwen/qwen3.8-27b` (LLM) y `whisper-large-v3-turbo` (STT); endpoint OpenAI-compatible
+   - API Key: variable de entorno `GROQ_API_KEY` (formato `gsk_…`)
+   - Límites plan gratis: ~30 RPM, ~1.000 req/día; ante `429` se respeta `retry-after`
 2. **Open-Meteo API** (clima, sin auth)
 3. **Edge-TTS** (voz, sin key)
 4. **DuckDuckGo** (búsqueda, sin key)
@@ -276,7 +278,7 @@ pytest                 # Tests
 ### Prerrequisitos
 - Python 3.8+
 - Windows 10/11 (modo micrófono)
-- API Key de Gemini (Google AI Studio)
+- API Key de Groq (console.groq.com/keys, plan gratuito)
 - `opencode` en el PATH (solo para la tool `ejecutar_opencode`)
 
 ### Pasos
@@ -289,9 +291,9 @@ venv\Scripts\activate  # Windows (source venv/bin/activate en Linux/Mac)
 # 2. Instalar dependencias (pinneadas)
 pip install -r requirements.txt
 
-# 3. Crear el .env con tu clave de Gemini
-# (Google AI Studio -> Get API key -> Create key)
-echo GOOGLE_API_KEY=tu_clave_aqui > .env
+# 3. Crear el .env con tu clave de Groq
+# (console.groq.com/keys -> Create API Key)
+echo GROQ_API_KEY=tu_clave_aqui > .env
 
 # 4. Ejecutar
 python main.py
@@ -307,7 +309,7 @@ python -m pytest -q
 
 ### Configuración de `.env`
 ```env
-GOOGLE_API_KEY=tu_clave_de_gemini
+GROQ_API_KEY=tu_clave_de_groq
 ```
 
 ---
@@ -326,8 +328,8 @@ Usuario: "Crea un skill de opencode para X en el proyecto briefing"
 
 ## 🧪 Testing
 
-- **53 tests** en `tests/` (`test_weather.py`, `test_news.py`, `test_search.py`, `test_tools_registry.py`, `test_brain.py`, `test_opencode_tool.py`).
-- Cubren: mapeo WMO, filtro de 24 h y caps de noticias, dedup de búsqueda, formato de declaración Live (validado offline contra el `LiveConnectConfig` del SDK), recorte de memoria por pares, dispatch de herramientas y el ciclo de `OpenCodeRunner` (confirmación, timeout, truncado) — todo mockeado, sin red.
+- **56 tests** en `tests/` (`test_weather.py`, `test_news.py`, `test_search.py`, `test_tools_registry.py`, `test_brain.py`, `test_opencode_tool.py`).
+- Cubren: mapeo WMO, filtro de 24 h y caps de noticias, dedup de búsqueda, formato de tools OpenAIA/Groq (`Brain._tools_openai`), formateo del contexto prefetch, recorte de memoria por pares, dispatch de herramientas y el ciclo de `OpenCodeRunner` (confirmación, timeout, truncado) — todo mockeado, sin red.
 - Verificación manual: `python -m pytest` y una corrida en modo texto preguntando clima/noticias/búsqueda.
 
 ---
@@ -344,12 +346,15 @@ Usuario: "Crea un skill de opencode para X en el proyecto briefing"
 ## 📝 Notas de Desarrollo
 
 ### Decisiones de Diseño
-1. **Gemini Live API por turno** sobre sesión persistente: aislamiento, sin estado web de larga vida, y memoria seed explícita
-2. **Registry declarativo** sobre dispatch manual: añadir una tool = una `Herramienta`, sin tocar `Brain`
-3. **Envelope `{status, data|mensaje}`** como contrato único: el LLM siempre recibe datos o un mensaje parseable
-4. **Recorte por pares** resolvió el bug del trim impreciso (tool calls huérfanas)
-5. **Edge-TTS + pygame lazy**: gratuito y sin dependencia de audio si se corre headless
-6. **opencode con confirmación + allowlist**: la única tool con efectos sobre el sistema de archivos
+1. **Texto streaming por turno en Groq**: la Live API de Google tardaba ~50 s en emitir su primer token y sufría `503` frecuentes; pasar el cerebro a **Groq** (hardware LPU) con `qwen/qwen3.8-27b` en streaming entrega el primer token en < 1 s (turno completo con prefetch ~4-6 s).
+2. **Prefetch de clima/noticias en paralelo**: elimina el round-trip de tools más caro y hace el turno de una sola llamada al modelo en el caso común.
+3. **Registry declarativo** sobre dispatch manual: añadir una tool = una `Herramienta`, sin tocar `Brain`
+4. **Envelope `{status, data|mensaje}`** como contrato único: el LLM siempre recibe datos o un mensaje parseable
+5. **Recorte por pares** resolvió el bug del trim impreciso (tool calls huérfanas)
+6. **Edge-TTS + pygame lazy**: gratuito y sin dependencia de audio si se corre headless
+7. **opencode con confirmación + allowlist**: la única tool con efectos sobre el sistema de archivos
+8. **Retries 429/5xx + fallback de tools**: resiliencia ante rate-limit y picos del API sin degradar la conversación a silencios
+9. **Migración completa a Groq (2026-09)**: se eliminó `google-genai` y `websockets`; el cerebro usa `chat.completions` streaming y el STT usa Whisper de Groq. Los modelos `llama-3.*` no existen en esta cuenta gratis: el cerebro es `qwen/qwen3.8-27b`.
 
 ### Limitaciones Conocidas
 - Modo micrófono solo en Windows (`msvcrt`)
@@ -361,8 +366,7 @@ Usuario: "Crea un skill de opencode para X en el proyecto briefing"
 
 ## 🔗 Referencias
 
-- [Gemini Live API docs](https://ai.google.dev/gemini-api/docs/live)
-- [Google AI Python SDK (google-genai)](https://github.com/googleapis/python-genai)
+- [Groq console y docs](https://console.groq.com)
 - [Edge-TTS](https://github.com/rany2/edge-tts)
 - [Open-Meteo API](https://open-meteo.com/en/docs)
 - [ddgs (DuckDuckGo Search)](https://github.com/fourleif/ddgs)
@@ -370,4 +374,4 @@ Usuario: "Crea un skill de opencode para X en el proyecto briefing"
 ---
 
 **Última actualización**: Septiembre 2026
-**Versión**: 2.0.0
+**Versión**: 3.1.0 (cerebro + STT migrados a Groq; adiós Google)

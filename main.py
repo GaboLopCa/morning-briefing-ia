@@ -1,8 +1,6 @@
 import sys
 import time as time_mod
 
-from dotenv import load_dotenv
-
 
 def _configurar_encoding_consola():
     """Fuerza UTF-8 en la consola (evita crashes de emojis/tildes al redirigir)."""
@@ -19,7 +17,7 @@ _configurar_encoding_consola()
 
 from config import (  # noqa: E402
     BRIEFING_POR_VOZ,
-    GOOGLE_API_KEY,
+    GROQ_API_KEY,
     LATITUD,
     LONGITUD,
     RSS_URLS,
@@ -63,9 +61,8 @@ def pedir_confirmacion_opencode(peticion, ruta):
 
 
 def main():
-    load_dotenv()
-    if not GOOGLE_API_KEY:
-        print("❌ Error Crítico: No se encontró la variable GOOGLE_API_KEY en el archivo .env.")
+    if not GROQ_API_KEY:
+        print("❌ Error Crítico: No se encontró la variable GROQ_API_KEY en el archivo .env.")
         return
 
     print("==========================================================")
@@ -96,9 +93,9 @@ def main():
         search=search_service,
         opencode=opencode_runner,
     )
-    ai_service = Brain(GOOGLE_API_KEY, registro)
+    ai_service = Brain(GROQ_API_KEY, registro)
     voice_service = VoiceAssistant()
-    ear_service = AudioEar(GOOGLE_API_KEY)
+    ear_service = AudioEar(GROQ_API_KEY)
 
     print("\n----------------------------------------------------------")
     print("🤖 CONFIGURACIÓN COMPLETADA CON ÉXITO")
@@ -146,7 +143,7 @@ def main():
                         if audio_file is None:
                             continue  # abortado por ESC o sin voz
 
-                        print("🧠 Transcribiendo audio con Gemini...")
+                        print("🧠 Transcribiendo audio con Groq Whisper...")
                         user_command = ear_service.transcribe_audio(audio_file)
                         if not user_command.strip():
                             print("⚠️ Transcripción vacía; intenta de nuevo.")
@@ -158,11 +155,11 @@ def main():
             # --- PIPELINE DE PROCESAMIENTO COMÚN (Orquestador Central) ---
             if user_command:
                 print("🤖 Enviando comando a la red cognitiva...")
-                briefing = ai_service.generate_response(user_command)
-
-                print("\n" + "=" * 40)
-                print(briefing)
-                print("=" * 40 + "\n")
+                briefing = ai_service.generate_response(
+                    user_command,
+                    on_fragment=lambda fragmento: print(fragmento, end="", flush=True),
+                )
+                print("\n" + "=" * 40 + "\n")
 
                 if modo == "texto":
                     if BRIEFING_POR_VOZ:

@@ -1,6 +1,6 @@
-groq
+groq==1.2.0
 requests
-feedparser 
+feedparser
 ddgs
 edge-tts
 pygame

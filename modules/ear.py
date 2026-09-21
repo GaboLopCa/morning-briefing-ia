@@ -4,8 +4,7 @@ import time as time_mod
 
 import numpy as np
 import sounddevice as sd
-from google import genai
-from google.genai import types
+from groq import Groq
 from scipy.io import wavfile
 
 from config import (
@@ -13,7 +12,6 @@ from config import (
     MODELO_TRANSCRIPCION,
     PAUSA_SILENCIO,
     UMBRAL_MINIMO_RMS,
-    VOCABULARIO_PERSONAL,
 )
 
 
@@ -38,7 +36,7 @@ class AudioEar:
         sample_rate=16000,
         modelo_transcripcion=MODELO_TRANSCRIPCION,
     ):
-        self.client = genai.Client(api_key=api_key)
+        self.client = Groq(api_key=api_key)
         self.modelo_transcripcion = modelo_transcripcion
         self.sample_rate = sample_rate
         self.temp_filename = "user_command.wav"
@@ -112,24 +110,18 @@ class AudioEar:
     # ----------------------------------------------------------- transcripción
 
     def transcribe_audio(self, file_path):
-        """Transcribe un WAV con el modelo de transcripción de Gemini."""
+        """Transcribe un WAV con Whisper de Groq (`whisper-large-v3-turbo`)."""
         if not file_path or not os.path.exists(file_path):
             return ""
         try:
             with open(file_path, "rb") as archivo:
-                audio_bytes = archivo.read()
-
-            response = self.client.models.generate_content(
-                model=self.modelo_transcripcion,
-                contents=[types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")],
-                config=types.GenerateContentConfig(
-                    audio_transcription_config=types.AudioTranscriptionConfig(
-                        language_codes=["es-CL"],
-                        custom_vocabulary=VOCABULARIO_PERSONAL,
-                    )
-                ),
-            )
-            return (getattr(response, "text", "") or "").strip()
+                transcripcion = self.client.audio.transcriptions.create(
+                    model=self.modelo_transcripcion,
+                    file=(os.path.basename(file_path), archivo, "audio/wav"),
+                    language="es",
+                    response_format="text",
+                )
+            return str(transcripcion or "").strip()
         except Exception as exc:  # noqa: BLE001
             print(f"❌ Error en transcripción: {exc}")
             return ""

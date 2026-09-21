@@ -1,20 +1,22 @@
 """Configuración central del asistente Josesito.
 
 Constantes del sistema y allowlist de proyectos para la tool `ejecutar_opencode`.
-La variable de entorno GOOGLE_API_KEY se carga desde `.env`.
+La variable de entorno GROQ_API_KEY se carga desde `.env`.
 """
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Ruta absoluta al .env del repo: independiente del cwd desde el que se lance.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # --- Credenciales ---
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# --- Modelos Gemini ---
-MODELO_LLM = "gemini-3.1-flash-live-preview"
-MODELO_TRANSCRIPCION = "gemini-3.5-transcribe"
+# --- Modelos (Groq, OpenAI-compatible) ---
+MODELO_LLM = "qwen/qwen3.8-27b"  # cerebro conversacional (+ tools), rápido y sin modo reasoning
+MODELO_TRANSCRIPCION = "whisper-large-v3-turbo"  # STT para el micrófono
 
 # --- Clima (Melipilla) ---
 LATITUD = -33.6895
@@ -43,6 +45,7 @@ DESCRIPCION_MAX = 200
 TIMEOUT_HTTP = 10
 NOTICIAS_WORKERS = 6        # hilos para descargar fuentes RSS en paralelo
 NOTICIAS_CACHE_TTL = 120    # segundos: no re-descargar feeds dentro de una misma sesión
+NOTICIAS_CONTEXTO = 15      # titulares que se inyectan al LLM en el contexto del turno
 SNIPPET_MAX = 300
 
 # --- Memoria conversacional ---
@@ -60,13 +63,6 @@ UMBRAL_MINIMO_RMS = 0.005
 VOZ_RAPIDEZ = 1.2
 VARIANTE_VOZ = "es-CL-LorenzoNeural"
 BRIEFING_POR_VOZ = True  # en modo texto, ¿leer en voz alta la respuesta?
-
-# Vocabulario personal para mejorar la transcripción (mapeo de términos chilenos/referencias)
-VOCABULARIO_PERSONAL = [
-    "Melipilla", "Josesito", "El Bulla", "Universidad de Chile",
-    "Groq", "API", "prompt", "software engineering",
-    "Pokémon", "F1", "NBA", "cachái", "al tiro",
-]
 
 # --- Tool ejecutar_opencode ---
 # Allowlist: el modelo solo elige un NOMBRE; nunca una ruta arbitraria.

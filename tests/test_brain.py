@@ -1,5 +1,3 @@
-from google.genai import types as genai_types
-
 from modules.summarizer import Brain
 from modules.tools import Herramienta, construir_registro
 
@@ -39,27 +37,28 @@ class TestBrainMemoria:
     def test_semilla_incluye_el_mensaje_actual(self):
         semilla = self.brain._construir_semilla("hola")
         assert len(semilla) == 1
-        assert semilla[0].role == "user"
-        assert semilla[0].parts[0].text == "hola"
+        assert semilla[0]["role"] == "user"
+        assert semilla[0]["content"] == "hola"
 
     def test_historial_crece_con_pares_completos(self):
         self.brain._guardar_en_historial("user1", "model1")
         self.brain._guardar_en_historial("user2", "model2")
         assert len(self.brain.historial) == 4
-        roles = [p.role for p in self.brain.historial]
-        assert roles == ["user", "model", "user", "model"]
+        roles = [p["role"] for p in self.brain.historial]
+        assert roles == ["user", "assistant", "user", "assistant"]
 
     def test_recorte_mantiene_n_pares_max(self):
         self.brain.max_historial_turnos = 2
         for i in range(6):
             self.brain._guardar_en_historial(f"u{i}", f"m{i}")
         assert len(self.brain.historial) == 4  # 2 turnos * 2 roles
-        assert self.brain.historial[0].parts[0].text == "u4"
+        assert self.brain.historial[0]["content"] == "u4"
 
     def test_semilla_con_historial_previa(self):
         self.brain._guardar_en_historial("u1", "m1")
         semilla = self.brain._construir_semilla("u2")
-        assert [p.role for p in semilla] == ["user", "model", "user"]
+        assert [p["role"] for p in semilla] == ["user", "assistant", "user"]
+        assert semilla[-1]["content"] == "u2"
 
     def test_limpiar_historial(self):
         self.brain._guardar_en_historial("u1", "m1")
@@ -93,22 +92,40 @@ class TestBrainHerramientas:
         assert "no pudo completar" in out["mensaje"]
 
 
-class TestBrainConfigLive:
-    def test_live_config_se_construye_offline(self):
+class TestBrainConfigGroq:
+    def test_tools_en_formato_openai(self):
         brain = Brain(api_key="clave-de-prueba", registro=_crear_registro())
         declaraciones = [h.a_declaracion() for h in brain.registro.values()]
 
-        config = genai_types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction="sistema de prueba",
-            tools=[{"function_declarations": declaraciones}],
-            temperature=0.7,
-            max_output_tokens=1024,
-            thinking_config=genai_types.ThinkingConfig(thinking_level="LOW"),
-            history_config=genai_types.HistoryConfig(initial_history_in_client_content=True),
-            output_audio_transcription=genai_types.AudioTranscriptionConfig(language_codes=["es-CL"]),
+        tools = brain._tools_openai(declaraciones)
+        assert tools
+        assert tools[0]["type"] == "function"
+        funcion = tools[0]["function"]
+        assert funcion["name"] in {
+            "get_weather_data",
+            "get_news_data",
+            "search_internet_data",
+            "ejecutar_opencode",
+        }
+        assert funcion["parameters"]["type"] == "object"
+
+    def test_tools_incluyen_todo_el_registro(self):
+        brain = Brain(api_key="clave-de-prueba", registro=_crear_registro())
+        tools = brain._tools_openai([h.a_declaracion() for h in brain.registro.values()])
+        nombres = {t["function"]["name"] for t in tools}
+        assert nombres == set(brain.registro)
+
+    def test_formatear_contexto_clima_y_noticias(self):
+        brain = Brain(api_key="clave-de-prueba", registro=_crear_registro())
+        bloque = brain._formatear_contexto(
+            {"status": "ok", "data": {"condition": "despejado", "current": 15, "max": 20, "min": 8, "rain_prob": 10}},
+            {"status": "ok", "data": [{"title": "Chile avanza", "description": "detalle"}]},
         )
-        assert config.tools is not None
-        assert config.history_config.initial_history_in_client_content is True
-        assert config.response_modalities == ["AUDIO"]
-        assert config.output_audio_transcription.language_codes == ["es-CL"]
+        assert "CONTEXTO DEL DÍA" in bloque
+        assert "despejado, ahora 15°C" in bloque
+        assert "Chile avanza" in bloque
+
+    def test_formatear_contexto_sin_datos(self):
+        brain = Brain(api_key="clave-de-prueba", registro=_crear_registro())
+        bloque = brain._formatear_contexto(None, {"status": "error", "mensaje": "cayó"})
+        assert "no disponible" in bloque
