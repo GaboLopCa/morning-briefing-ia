@@ -12,6 +12,10 @@ Sesión 4: el mismo `Capturador` alimenta la wake word y, cuando la máquina est
 en GRABANDO, una `Grabadora` (VAD por RMS) acumula bloques; el corte por
 silencio dispara FIN_AUDIO (ruta WAV en temp) y la transcripción con Whisper
 (Groq) corre en un hilo que encola TEXTO_LISTO cuando termina.
+
+Sesión 5: `MotorConversacion` (router → Brain → TTS) resuelve desde PENSANDO y
+habla desde HABLANDO, siempre en hilos daemon que encolan `RESPUESTA_LISTA` /
+`TERMINAR_VOZ`, sin bloquear jamás el hilo único de la cola.
 """
 import argparse
 import logging
@@ -27,6 +31,7 @@ from config import (
 )
 from modules.audio_stream import Capturador
 from modules.cola import ColaEventos
+from modules.conversacion import crear_motor
 from modules.ear import transcribir
 from modules.estados import Estado, Evento, MaquinaEstados
 from modules.hotkeys import DetectorHotkeys, Hotkeys
@@ -65,12 +70,43 @@ def _transcribir_y_encolar(ruta, encolar, api_key=GROQ_API_KEY):
     threading.Thread(target=_trabajo, daemon=True, name="josesito-transcribe").start()
 
 
-def construir_manejadores(compartido=None, grabadora=None, encolar=None, transcribir=None):
+def _resolver_y_encolar(motor, texto, encolar):
+    """Resuelve (router → Brain) fuera de la cola y encola RESPUESTA_LISTA (o ERROR)."""
+
+    def _trabajo():
+        try:
+            respuesta = motor.resolver(texto)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Fallo al resolver: %s", exc)
+            encolar(Evento.ERROR)
+            return
+        encolar(Evento.RESPUESTA_LISTA, respuesta)
+
+    threading.Thread(target=_trabajo, daemon=True, name="josesito-pensar").start()
+
+
+def _hablar_y_encolar(motor, respuesta, encolar):
+    """Sintetiza/reproduce la respuesta y encola TERMINAR_VOZ al terminar."""
+
+    def _trabajo():
+        try:
+            motor.hablar(respuesta)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Fallo al hablar: %s", exc)
+        finally:
+            encolar(Evento.TERMINAR_VOZ)
+
+    threading.Thread(target=_trabajo, daemon=True, name="josesito-hablar").start()
+
+
+def construir_manejadores(compartido=None, grabadora=None, encolar=None,
+                          transcribir=None, motor=None):
     """Handlers de entrada a cada estado.
 
-    `grabadora`/`encolar`/`transcribir` se inyectan solo en el modo real: con
-    ellos, GRABANDO empieza a acumular audio y TRANSCRIBIENDO transcribe en un
-    hilo. En `--debug` no se pasan y los handlers solo loguean.
+    En modo real se inyectan `grabadora`/`encolar`/`transcribir`/`motor`: así
+    GRABANDO acumula audio, TRANSCRIBIENDO transcribe en un hilo, PENSANDO
+    resuelve la frase (router → Brain) y HABLANDO la habla — todo sin bloquear
+    el hilo de la cola. En `--debug` no se pasan y los handlers solo loguean.
     """
     if compartido is None:
         compartido = Compartido()
@@ -87,6 +123,11 @@ def construir_manejadores(compartido=None, grabadora=None, encolar=None, transcr
         return _fn
 
     def _al_grabando(datos):
+        # Barge-in: si venimos de HABLANDO (wake word o PTT mientras hablaba),
+        # cortamos el TTS y limpiamos el gating de forma explícita.
+        if motor is not None:
+            motor.detener()
+            compartido.hablando = False
         if grabadora is not None:
             grabadora.comenzar()
         logger.info("Grabando voz")
@@ -105,12 +146,35 @@ def construir_manejadores(compartido=None, grabadora=None, encolar=None, transcr
         logger.info("Transcribiendo en hilo: %s", ruta)
         transcribir(ruta)
 
+    def _al_pensando(datos):
+        if motor is None or encolar is None:
+            logger.info("Pensando [texto=%s]" if datos else "Pensando")
+            return
+        if not datos:
+            logger.info("Sin texto que procesar; vuelvo a IDLE.")
+            encolar(Evento.ERROR)
+            return
+        logger.info("Pensando (en hilo): %s", datos)
+        _resolver_y_encolar(motor, datos, encolar)
+
+    def _al_hablando(datos):
+        compartido.hablando = True
+        if motor is None or encolar is None:
+            logger.info("Hablando [respuesta=%s]" if datos else "Hablando")
+            return
+        if not datos:
+            logger.info("Sin respuesta que decir; vuelvo a IDLE.")
+            encolar(Evento.TERMINAR_VOZ)
+            return
+        logger.info("Hablando (TTS en hilo)")
+        _hablar_y_encolar(motor, datos, encolar)
+
     return {
         Estado.IDLE: _manejador("En reposo (escuchando trigger)", hablando=False),
         Estado.GRABANDO: _al_grabando,
         Estado.TRANSCRIBIENDO: _al_transcribiendo,
-        Estado.PENSANDO: _manejador("Pensando", "texto"),
-        Estado.HABLANDO: _manejador("Hablando", "respuesta", hablando=True),
+        Estado.PENSANDO: _al_pensando,
+        Estado.HABLANDO: _al_hablando,
         Estado.PAUSADO: _manejador("Pausado"),
     }
 
@@ -193,12 +257,15 @@ def main(argv=None):
             on_abortado=lambda: cola.encolar(Evento.AUDIO_ABORTADO),
         )
 
+        motor = crear_motor()
+
         maquina = MaquinaEstados(
             construir_manejadores(
                 compartido,
                 grabadora=grabadora,
                 encolar=cola.encolar,
                 transcribir=lambda ruta: _transcribir_y_encolar(ruta, cola.encolar),
+                motor=motor,
             )
         )
         cola.iniciar(lambda evento, datos: maquina.evento(evento, datos))

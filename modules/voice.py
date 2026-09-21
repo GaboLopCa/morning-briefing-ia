@@ -17,6 +17,7 @@ class VoiceAssistant:
         self.voice = variante
         self._mixer_iniciado = False
         self._habilitado = True
+        self._detener = False
 
     def clean_text(self, text):
         texto_limpio = re.sub(r"https?://\S+", "", text)
@@ -40,6 +41,16 @@ class VoiceAssistant:
         communicate = edge_tts.Communicate(text, self.voice, rate=self.speed_str)
         await communicate.save(output_file)
 
+    def detener(self):
+        """Frena la reproducción y la síntesis en curso (barge-in); no lanza si falta mixer."""
+        self._detener = True
+        if not self._mixer_iniciado:
+            return
+        try:
+            pygame.mixer.music.stop()
+        except pygame.error:
+            pass
+
     def speak(self, text):
         if not self._habilitado:
             return
@@ -49,14 +60,16 @@ class VoiceAssistant:
         if not self._iniciar_mixer():
             return
 
+        self._detener = False
         temp_file = os.path.join(tempfile.gettempdir(), f"speech_{os.getpid()}.mp3")
         try:
             asyncio.run(self._generate_audio(text, temp_file))
-
+            if self._detener:  # barge-in durante la síntesis: no reproducir
+                return
             pygame.mixer.music.load(temp_file)
             pygame.mixer.music.play()
             print(f"🔊 Assistant speaking (Edge-TTS) at {self.speed_str} speed...")
-            while pygame.mixer.music.get_busy():
+            while pygame.mixer.music.get_busy() and not self._detener:
                 time_mod.sleep(0.1)
             pygame.mixer.music.unload()
         except Exception as exc:  # noqa: BLE001

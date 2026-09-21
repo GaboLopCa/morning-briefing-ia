@@ -11,12 +11,15 @@ sigue funcionando con hotkeys/bandeja (solo se pierde la wake word).
 """
 import logging
 from pathlib import Path
+import time as time_mod
 import urllib.request
 
 from config import (
     WAKE_WORD_ARCHIVO,
     WAKE_WORD_HISTERESIS,
     WAKE_WORD_MODELO,
+    WAKE_WORD_REPORTE_INTERVALO,
+    WAKE_WORD_REPORTE_UMBRAL,
     WAKE_WORD_UMBRAL,
 )
 
@@ -37,27 +40,36 @@ def _clave_prediccion(claves):
 
 
 class WakeWordDetector:
-    """Detecta el flanco de la wake word con histéresis y gating de eco.
+    """Detecta el flanco de la wake word con histéresis y reporte de near-miss.
 
     - Retroceso: solo dispara una vez por mantención de energía sonora.
-    - Gating: mientras `esta_hablando()` sea True, no dispara (el asistente se
-      oye a sí mismo), pero se blinda para no disparar al terminar de hablar.
+    - Sin gating de eco: dispara también mientras el asistente habla (barge-in,
+      sesión 5.b). La decisión de interrumpir la toma la máquina de estados.
+    - Reporte: cuando el puntaje queda entre `reporte_umbral` y el umbral real
+      (casi dispara, sin llegar), llama `al_reporte(clave, puntaje)` como
+      máximo cada `reporte_intervalo` segundos — sirve para calibrar el umbral
+      al acento del usuario ("no me oye" -> ver el log y bajar `WAKE_WORD_UMBRAL`).
     """
 
     def __init__(
         self,
         modelo,
         al_detectar=None,
+        al_reporte=None,
         umbral=WAKE_WORD_UMBRAL,
         histeresis=WAKE_WORD_HISTERESIS,
-        esta_hablando=None,
+        reporte_umbral=WAKE_WORD_REPORTE_UMBRAL,
+        reporte_intervalo=WAKE_WORD_REPORTE_INTERVALO,
     ):
         self._modelo = modelo
         self.al_detectar = al_detectar
+        self.al_reporte = al_reporte
         self._umbral = umbral
         self._hist = histeresis
-        self._esta_hablando = esta_hablando or (lambda: False)
+        self._reporte_umbral = reporte_umbral
+        self._reporte_intervalo = reporte_intervalo
         self._disparado = False
+        self._ultimo_reporte = 0.0
 
     def alimentar(self, audio):
         """`audio`: np.ndarray int16 mono (~80 ms). True solo en el flanco."""
@@ -69,11 +81,16 @@ class WakeWordDetector:
         if puntaje >= self._umbral:
             if not self._disparado:
                 self._disparado = True
-                if not self._esta_hablando() and self.al_detectar is not None:
+                if self.al_detectar is not None:
                     self.al_detectar()
                     return True
         elif puntaje < self._hist:
             self._disparado = False
+        if self.al_reporte is not None and self._umbral > puntaje >= self._reporte_umbral:
+            ahora = time_mod.monotonic()
+            if ahora - self._ultimo_reporte >= self._reporte_intervalo:
+                self._ultimo_reporte = ahora
+                self.al_reporte(clave, puntaje)
         return False
 
     def reset(self):
@@ -122,7 +139,13 @@ def crear_detector(compartido=None, al_detectar=None):
     detector = WakeWordDetector(
         modelo,
         al_detectar=al_detectar,
-        esta_hablando=(lambda: compartido.hablando) if compartido else (lambda: False),
+        al_reporte=lambda clave, puntaje: logger.info(
+            "Wake word casi dispara: %s = %.3f (umbral %s). Si no te oye, baja "
+            "WAKE_WORD_UMBRAL en config.py.",
+            clave,
+            puntaje,
+            WAKE_WORD_UMBRAL,
+        ),
     )
     logger.info("Wake word activa (modelo: %s, umbral: %s).", WAKE_WORD_MODELO, WAKE_WORD_UMBRAL)
     return detector

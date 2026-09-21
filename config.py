@@ -110,7 +110,9 @@ TRAY_NOMBRE = "Josesito"
 # Para custom: WAKE_WORD_ARCHIVO = ruta a un .onnx entrenado.
 WAKE_WORD_MODELO = "hey jarvis"  # preentrenado que trae openwakeword
 WAKE_WORD_ARCHIVO = None         # None = usar el preentrenado por clave/lista
-WAKE_WORD_UMBRAL = 0.5           # score para disparar
-WAKE_WORD_HISTERESIS = 0.25      # por debajo de esto se rearma el detector
+WAKE_WORD_UMBRAL = 0.4           # score para disparar (baja si "no oye")
+WAKE_WORD_HISTERESIS = 0.2      # por debajo de esto se rearma el detector
+WAKE_WORD_REPORTE_UMBRAL = 0.05   # desde aquí se reporta el score en logs
+WAKE_WORD_REPORTE_INTERVALO = 5.0  # segundos entre reportes (anti-rgb masivo)
 STREAM_TASA = 16000              # el modelo de openwakeword usa 16 kHz
 STREAM_BLOQUE = 1280             # frames por bloque = 80 ms @ 16 kHz

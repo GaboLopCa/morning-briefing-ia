@@ -1,6 +1,6 @@
 # Tareas Pendientes — Josesito (Josesito Home Assistant)
 
-Documento de trabajo con el roadmap y las decisiones ya tomadas. Especificación técnica: `README.md`. Convenciones: español, commits convencionales. Estado actual (2026-09): **v3.5.0** con cerebro Groq (`qwen/qwen3.8-27b`), STT Whisper (`whisper-large-v3-turbo`), **router de intenciones por reglas** y **segundo plano con wake word JARVIS + transcripción de voz** (119 tests verdes).
+Documento de trabajo con el roadmap y las decisiones ya tomadas. Especificación técnica: `README.md`. Convenciones: español, commits convencionales. Estado actual (2026-09): **v3.6.1** con cerebro Groq (`qwen/qwen3.8-27b`), STT Whisper (`whisper-large-v3-turbo`), **router de intenciones por reglas** y **segundo plano con wake word JARVIS que conversa de verdad y se deja interrumpir (barge-in)** (132 tests verdes).
 
 > Marca con `[x]` lo que vaya quedando listo.
 
@@ -14,7 +14,9 @@ Cada sesión deja el proyecto en estado funcional y testeable.
 | 2 | ✅ **Terminada** | Hotkeys (`modules/hotkeys.py` + `DetectorHotkeys` puro) + bandeja (`modules/tray.py`, `pystray` + `Pillow`) + `modules/cola.py` (eventos → un hilo) + menú opción 3 en `main.py`. Deps pineadas. **98 tests verdes.** |
 | 3 | ✅ **Terminada** | Wake word **JARVIS**: `modules/wakeword.py` (`WakeWordDetector` + factoría con descarga automática de modelos ONNX desde GitHub Releases), `modules/audio_stream.py` (InputStream 16 kHz continuo), gating de eco (`Compartido.hablando`), `Evento.WAKE` → cola. Modelo preentrenado "hey jarvis". **107 tests verdes.** |
 | 4 | ✅ **Terminada** | **Audio para transcripción**: `modules/recorder.py` (`Grabadora` VAD por RMS reutilizable, `nivel_rms` normaliza int16 a [-1,1], WAV en `tempfile`, corte por silencio/tope/PTT), `modules/ear.py` refactorizado (reusa `Grabadora`; `transcribir()` standalone sin prints), `app.py` graba desde el mismo `Capturador` y lanza Whisper en un hilo → `Evento.TEXTO_LISTO`. **119 tests verdes.** |
-| 5 | ⏳ Siguiente | Conectar PENSANDO → `Brain` (router/preguntas) y HABLANDO → TTS (edge-tts + pygame); de momento el flujo llega hasta PENSANDO y queda en logging. |
+| 5 | ✅ **Terminada** | **Conversación**: `modules/conversacion.py` (`MotorConversacion` = router → Brain → TTS; `crear_motor()` arma providers+registry; confirmador de opencode que rechaza sin UI), `app.py` resuelve desde PENSANDO y habla desde HABLANDO en hilos daemon que encolan `RESPUESTA_LISTA`/`TERMINAR_VOZ`. **127 tests verdes.** |
+| 5.b | ✅ **Terminada** | **Barge-in + wake word que no oía**: dispara siempre (la máquina decide), umbral 0.4, log de near-misses para calibrar, `VoiceAssistant.detener()` corta el TTS, transiciones HABLANDO→GRABANDO por WAKE/PTT. **132 tests verdes.** |
+| 6+ | ⏳ Siguiente | Chateo remoto desde el celular (Telegram recomendado), `pc_actions`, memoria RAG, Home Assistant. |
 
 ---
 
@@ -58,7 +60,21 @@ Arquitectura acordada: un único `sounddevice.InputStream` de 16 kHz siempre abi
 - [x] `app.py`: la misma `Grabadora` acumula bloques del `Capturador` cuando la máquina entra en GRABANDO; el corte dispara `FIN_AUDIO`/`AUDIO_ABORTADO` y la transcripción Whisper corre en un hilo (`_transcribir_y_encolar`) que encola `TEXTO_LISTO` (o `ERROR`). `construir_manejadores(compartido, grabadora, encolar, transcribir)` inyecta todo; sin inyección (= `--debug`) solo loguea. `logger` ya no inicia en `None`: getLogger("josesito") para que handlers/test sin `main()` no rompan.
 - [x] Tests: `tests/test_recorder.py` (8) + `tests/test_flujo_audio.py` (4, E2E con reloj simulado: WAKE→voz→silencio→PENSANDO con texto; wake sin voz→IDLE; PTT suelto sin silencio→transcribe igual; WAV en temp absoluta).
 
-**Nota**: esto elimina `msvcrt` del flujo de mic → resuelve de facto el pendiente de **AudioEar multiplataforma**. El flujo completo de conversación (PENSANDO→respuesta→HABLANDO→TTS) es la **sesión 5**; por ahora el segundo plano transcribe y deja el texto en `logs` (estado PENSANDO). **Grabadora**: palanca `DURACION_MAX_GRABACION` también aplica como tope *previo* a la primera voz (silencio) — si la wake word dispara en falso, espera ese tope y vuelve a IDLE.
+**Nota**: esto elimina `msvcrt` del flujo de mic → resuelve de facto el pendiente de **AudioEar multiplataforma**. **Grabadora**: palanca `DURACION_MAX_GRABACION` también aplica como tope *previo* a la primera voz (silencio) — si la wake word dispara en falso, espera ese tope y vuelve a IDLE.
+
+### Sesión 5 — Conversación (terminada)
+- [x] `modules/conversacion.py`: `MotorConversacion` reúne la cascada `router.decidir → Brain.generate_response` (respuesta hablable) y el TTS (`voice.speak`). `crear_motor()` ensambla los providers reales (clima/noticias/búsqueda/opencode) + registry + router + Brain (solo si `GROQ_API_KEY`; si falta responde únicamente el router local) + `VoiceAssistant`.
+- [x] `app.py`: los manejadores **PENSANDO y HABLANDO ya no bloquean** el hilo único de la cola: `_resolver_y_encolar` (hilo daemon → `RESPUESTA_LISTA`/`ERROR`) y `_hablar_y_encolar` (hilo daemon → `TERMINAR_VOZ` al terminar de hablar). La máquina queda en PENSANDO mientras el Brain trabaja y en HABLANDO mientras suena el TTS (gating de eco ya activo: la wake word no se oye a sí misma).
+- [x] **ejecutar_opencode desde la voz se rechaza**: `_confirmar_segundo_plano` loguea y devuelve False (no hay consola ni UI de confirmación); el Brain narra "el usuario canceló".
+- [x] Tests: `tests/test_conversacion.py` (5) + `tests/test_flujo_conversacion.py` (3, E2E completo IDLE→IDLE con gating; silencio sin voz no habla; TEXTO_LISTO directo por cola).
+
+**Nota UX**: mientras Josesito "piensa" (5-35 s si llama al Brain) no hay feedback sonoro y los triggers nuevos se ignoran (mejora pendiente). El barge-in (interrumpir con la wake word o PTT mientras habla) **ya funciona** — ver sesión 5.b.
+
+### Sesión 5.b — Barge-in y arreglo de wake word (terminada)
+- [x] **Barge-in**: transiciones `(HABLANDO, WAKE)` y `(HABLANDO, PTT)` → GRABANDO. El manejador GRABANDO llama `motor.detener()` (corta pygame y la síntesis en curso vía `VoiceAssistant.detener()`) y limpia `Compartido.hablando`.
+- [x] **Wake word no oía**: el detector ya no hace gating de eco («hablando → no dispara») — dispara siempre y la **máquina** decide (así el barge-in es posible; edge-tts casi nunca dice "hey jarvis"). Umbral por defecto bajado a `WAKE_WORD_UMBRAL=0.4` (histéresis 0.2).
+- [x] **Diagnóstico de calibración**: `WakeWordDetector` reporta **near-misses** (`al_reporte`, throttled a 1 cada `WAKE_WORD_REPORTE_INTERVALO=5.0` s, desde `WAKE_WORD_REPORTE_UMBRAL=0.05`): si la wake word "casi dispara" pero no alcanza, el log deja ver el score real → bajar/ajustar el umbral a tu acento.
+- [x] Tests: `test_estados.py` (2 barge-in), `test_wakeword.py` (dispara mientras habla + throttling del reporte), `test_conversacion.py` (`motor.detener`), `test_flujo_conversacion.py` (E2E barge-in: corta el TTS y encadena una segunda conversación). **132 tests verdes.**
 
 ---
 
@@ -69,8 +85,8 @@ Decisión: usar **JARVIS** como wake word. `openWakeWord` ya trae un modelo pree
 - [x] Validar el modelo preentrenado **"hey jarvis"** de `openWakeWord` (carga ONNX, predice, integrado al pipeline). **Pendiente de validación en terreno** (hablarle; ajustar falso positivo).
 - [ ] Probar frase corta "jarvis" vs "hey jarvis" y elegir.
 - [ ] Si hace falta, entrenar modelo custom (grabaciones reales + voces Piper + negativos; vías: `openwakeword.com` Training Center o entrenadores locales tipo `jota-wake-trainer` / `custom-wakeword-trainer`, ~840 KB ONNX).
-- [ ] Ajustar `WAKE_WORD_UMBRAL` (bajo → deja de oír; alto → se dispara solo).
-- [ ] (Opcional) Barge-in: interrumpir a Josesito diciendo la wake word mientras habla.
+- [x] Ajustar `WAKE_WORD_UMBRAL` (bajo → deja de oír; alto → se dispara solo). **Arreglado de facto**: umbral 0.4 + log de near-misses para calibrar a tu acento.
+- [x] (Barge-in) Interrumpir a Josesito diciendo la wake word mientras habla. **Hecho en la sesión 5.b** (también con PTT).
 
 **Descartado**: Porcupine/Picovoice (terminó su tier gratuito el 2026-06-30).
 
@@ -147,6 +163,8 @@ Idea de Gabriel (2026-09). Implementarlas como herramientas del **router por reg
 | 2026-09 | Modelos Groq disponibles para esta cuenta: qwen/qwen3.8-27b (cerebro), gpt-oss-20b/120b, compound, whisper-large-v3(-turbo). No hay llama-3.*. |
 | 2026-09 | Nueva skill futura: **ver calendario + fecha/hora** (router por reglas; calendario vía fuente a decidir, candidata `.ics` local). |
 | 2026-09 | Sesión 4: **grabación VAD reutilizable** (`modules/recorder.py`) compartida entre `ear.py` (modo mic) y el segundo plano; **transcripción en hilo** propio que encola `TEXTO_LISTO`/`ERROR`; WAV siempre en `tempfile`; `logger` inicia como `getLogger("josesito")` (no `None`). |
+| 2026-09 | Sesión 5: **PENSANDO y HABLANDO corren en hilos daemon** (nunca bloquean el hilo de la cola) y encolan `RESPUESTA_LISTA`/`TERMINAR_VOZ`. `ejecutar_opencode` **se rechaza desde la voz** (sin confirmación UI); el Brain solo responde si hay `GROQ_API_KEY`, si no, solo router local. Sin barge-in por ahora. |
+| 2026-09 | Sesión 5.b: **barge-in** (wake word o PTT mientras habla corta el TTS y pasa a escuchar; `VoiceAssistant.detener()`). Wake word que "no oía": el detector **ya no gatea** (dispara siempre, decide la máquina), umbral base 0.4 y **near-misses visibles en el log** para calibrar `WAKE_WORD_UMBRAL` al acento. |
 
 ## Descartado a propósito
 

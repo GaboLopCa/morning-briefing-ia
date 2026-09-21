@@ -76,3 +76,25 @@ def test_error_desde_pensando():
     maquina.evento(Evento.FIN_AUDIO)
     maquina.evento(Evento.TEXTO_LISTO, "x")
     assert maquina.evento(Evento.ERROR) is Estado.IDLE
+
+
+def test_barge_in_wake_interrumpe_el_turno_de_habla():
+    maquina = MaquinaEstados()
+    maquina.evento(Evento.WAKE)
+    maquina.evento(Evento.FIN_AUDIO)
+    maquina.evento(Evento.TEXTO_LISTO, "hola")
+    maquina.evento(Evento.RESPUESTA_LISTA, "respuesta")
+    assert maquina.estado is Estado.HABLANDO
+    assert maquina.evento(Evento.WAKE) is Estado.GRABANDO
+    assert maquina.evento(Evento.PTT_SOLTAR) is Estado.TRANSCRIBIENDO
+
+
+def test_barge_in_ptt_interrumpe_el_turno_de_habla():
+    maquina = MaquinaEstados()
+    maquina.evento(Evento.PTT)
+    maquina.evento(Evento.FIN_AUDIO)
+    maquina.evento(Evento.TEXTO_LISTO, "pregunto")
+    maquina.evento(Evento.RESPUESTA_LISTA, "respuesta")
+    assert maquina.estado is Estado.HABLANDO
+    assert maquina.evento(Evento.PTT) is Estado.GRABANDO
+    assert maquina.evento(Evento.FIN_AUDIO) is Estado.TRANSCRIBIENDO

@@ -55,21 +55,28 @@ def test_rearme_tras_caer_bajo_la_histeresis():
     assert disparos == ["jarvis", "jarvis"]
 
 
-def test_gating_mientras_habla():
-    hablando = {"valor": True}
-
-    def _hablando():
-        return hablando["valor"]
-
-    detector, modelo, disparos = _detector(esta_hablando=_hablando)
+def test_dispara_mientras_habla_barge_in():
+    """Sin gating de eco: la wake word dispara aunque el asistente hable (barge-in)."""
+    detector, modelo, disparos = _detector()
     modelo.cola = [{"hey jarvis": 0.9}, {"hey jarvis": 0.1}]
-    assert detector.alimentar(np.zeros(1280, dtype=np.int16)) is False  # hablando
-    assert disparos == []
-    assert detector.alimentar(np.zeros(1280, dtype=np.int16)) is False  # rearma
-    hablando["valor"] = False
-    modelo.cola = [{"hey jarvis": 0.9}]
-    assert detector.alimentar(np.zeros(1280, dtype=np.int16)) is True  # ya libre
+    assert detector.alimentar(np.zeros(1280, dtype=np.int16)) is True
     assert disparos == ["jarvis"]
+    assert detector.alimentar(np.zeros(1280, dtype=np.int16)) is False  # rearma
+
+
+def test_reporte_near_miss_va_por_debajo_del_umbral_y_es_throttled():
+    reports = []
+    detector, modelo, _ = _detector(al_reporte=lambda c, p: reports.append((c, p)))
+    # por debajo del umbral (0.4) y por encima del umbral de reporte -> reporta una vez.
+    modelo.cola = [{"hey jarvis": 0.3}, {"hey jarvis": 0.3}]
+    assert detector.alimentar(np.zeros(1280, dtype=np.int16)) is False
+    assert detector.alimentar(np.zeros(1280, dtype=np.int16)) is False
+    assert reports == [("hey jarvis", 0.3)]  # throttled a 1 por intervalo
+    # silencio (bajo `reporte_umbral`) o disparo real no reportan.
+    modelo.cola = [{"hey jarvis": 0.0}, {"hey jarvis": 0.9}]
+    detector.alimentar(np.zeros(1280, dtype=np.int16))
+    detector.alimentar(np.zeros(1280, dtype=np.int16))
+    assert reports == [("hey jarvis", 0.3)]
 
 
 def test_clave_jarvis_gana_y_reset_rearma():

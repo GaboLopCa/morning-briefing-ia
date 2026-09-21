@@ -55,6 +55,10 @@ TRANSICIONES = {
     (Estado.PENSANDO, Evento.ERROR): Estado.IDLE,
     (Estado.HABLANDO, Evento.TERMINAR_VOZ): Estado.IDLE,
     (Estado.HABLANDO, Evento.ERROR): Estado.IDLE,
+    # Barge-in (sesión 5.b): despierta la wake word o pulsa PTT mientras Josesito
+    # habla → corta el TTS y pasa a escuchar. El manejador GRABANDO frena la voz.
+    (Estado.HABLANDO, Evento.WAKE): Estado.GRABANDO,
+    (Estado.HABLANDO, Evento.PTT): Estado.GRABANDO,
 }
 
 
